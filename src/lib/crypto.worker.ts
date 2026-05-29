@@ -1,5 +1,5 @@
 import { encryptFile, decryptFile, encryptFileTurbo, decryptFileTurbo } from './crypto';
-import { encryptHybrid, decryptHybrid, importKey } from './hybrid-crypto';
+import { encryptHybrid, decryptHybrid } from './hybrid-crypto';
 
 /**
  * Web Worker for Cryptographic Operations
@@ -24,10 +24,10 @@ self.onmessage = async (e: MessageEvent) => {
 
       case 'DECRYPT_SYMMETRIC': {
         const { file, password, settings } = payload;
-        const { blob, fileName } = await decryptFile(file, password, settings, (progress) => {
+        const { blob, fileName, watermark } = await decryptFile(file, password, settings, (progress) => {
           self.postMessage({ type: 'PROGRESS', payload: progress, id });
         });
-        self.postMessage({ type: 'SUCCESS', payload: { blob, fileName }, id });
+        self.postMessage({ type: 'SUCCESS', payload: { blob, fileName, watermark }, id });
         break;
       }
 
@@ -62,10 +62,10 @@ self.onmessage = async (e: MessageEvent) => {
       case 'DECRYPT_HYBRID': {
         const { file, privateKeyJwk, verifyKeyJwk } = payload;
         const packageData = await file.arrayBuffer();
-        const { decryptedData, fileName } = await decryptHybrid(packageData, privateKeyJwk, verifyKeyJwk, (progress) => {
+        const { decryptedData, fileName, watermark } = await decryptHybrid(packageData, privateKeyJwk, verifyKeyJwk, (progress) => {
           self.postMessage({ type: 'PROGRESS', payload: progress, id });
         });
-        self.postMessage({ type: 'SUCCESS', payload: { decryptedData, fileName }, id });
+        self.postMessage({ type: 'SUCCESS', payload: { decryptedData, fileName, watermark }, id });
         break;
       }
 
