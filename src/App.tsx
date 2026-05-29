@@ -63,7 +63,7 @@ export default function App() {
   const [progress, setProgress] = useState(0);
   const [mode, setMode] = useState<'encrypt' | 'decrypt'>('encrypt');
   const [cryptoType, setCryptoType] = useState<'symmetric' | 'hybrid' | 'turbo'>('symmetric');
-  const [result, setResult] = useState<{ blob: Blob; name: string; signatureVerified?: boolean } | null>(null);
+  const [result, setResult] = useState<{ blob: Blob; name: string; signatureVerified?: boolean; watermark?: string } | null>(null);
   const [copied, setCopied] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [isAboutOpen, setIsAboutOpen] = useState(false);
@@ -104,7 +104,7 @@ export default function App() {
     };
 
     const handleRejection = (event: PromiseRejectionEvent) => {
-      event.preventDefault(); // Prevent browser from logging to console
+      event.preventDefault();
       const reason = event.reason;
       
       let message = 'An unexpected operation failure occurred.';
@@ -124,7 +124,6 @@ export default function App() {
         }
       }
       
-      // Filter out benign errors or empty rejections if necessary
       if (!message || message.trim() === '' || message === 'undefined' || message === 'null' || message === '[object Object]') {
         message = 'Unknown system error';
       }
@@ -266,7 +265,6 @@ export default function App() {
         return;
       }
 
-      // Basic JWK validation
       try {
         if (mode === 'encrypt' && publicKey) JSON.parse(publicKey);
         if (mode === 'decrypt' && privateKey) JSON.parse(privateKey);
@@ -278,7 +276,6 @@ export default function App() {
       }
     }
 
-    // Memory usage warning for large files in the batch
     const hasVeryLargeFile = queue.some(item => item.file.size / (1024 * 1024) > 500);
     if (hasVeryLargeFile && argon2Settings.memorySize > 262144) {
       const proceed = window.confirm('One or more files are very large and high-performance memory settings are enabled. This might cause the browser to slow down. Do you want to proceed?');
@@ -289,7 +286,6 @@ export default function App() {
     setProgress(0);
     setResult(null);
 
-    // Initialise item statuses
     setQueue(prev => prev.map(item => ({
       ...item,
       status: item.status === 'completed' ? 'completed' : 'queued',
@@ -301,7 +297,6 @@ export default function App() {
     let failureCount = 0;
     const totalItems = queue.length;
 
-    // We process sequentially
     for (let i = 0; i < totalItems; i++) {
       const item = queue[i];
       if (item.status === 'completed') {
@@ -314,7 +309,6 @@ export default function App() {
       try {
         let fileObj = item.file;
 
-        // Auto-decode if the input file contains space-separated numbers or hex sequences
         if (mode === 'decrypt') {
           try {
             const partText = await fileObj.slice(0, Math.min(1000, fileObj.size)).text();
@@ -332,10 +326,10 @@ export default function App() {
         let finalBlob: Blob | null = null;
         let finalName = '';
         let sigVerified = false;
+        let watermark = '';
 
         const updateItemProgress = (p: number) => {
           setQueue(prev => prev.map(qItem => qItem.id === item.id ? { ...qItem, progress: p } : qItem));
-          // Calculate overall progress across files
           const completedContribution = (successCount + failureCount) * 100;
           const currentContribution = p;
           const totalProgress = Math.round((completedContribution + currentContribution) / totalItems);
@@ -350,9 +344,10 @@ export default function App() {
             finalBlob = encryptedBlob;
             finalName = 'JohnCrypt.enc';
           } else {
-            const { blob, fileName } = await cryptoWorker.decryptSymmetric(fileObj, password, argon2Settings, updateItemProgress);
-            finalBlob = blob;
-            finalName = fileName;
+            const result = await cryptoWorker.decryptSymmetric(fileObj, password, argon2Settings, updateItemProgress);
+            finalBlob = result.blob;
+            finalName = result.fileName;
+            watermark = result.watermark || '';
           }
         } else if (cryptoType === 'turbo') {
           if (mode === 'encrypt') {
@@ -360,191 +355,388 @@ export default function App() {
             finalBlob = encryptedBlob;
             finalName = 'JohnCrypt.enc';
           } else {
-            const { blob, fileName } = await cryptoWorker.decryptTurbo(fileObj, password, updateItemProgress);
-            finalBlob = blob;
-            finalName = fileName;
+            const result = await cryptoWorker.decryptTurbo(fileObj, password, updateItemProgress);
+            finalBlob = result.blob;
+            finalName = result.fileName;
           }
         } else {
-          // Hybrid Mode
           if (mode === 'encrypt') {
             const encryptedBlob = await cryptoWorker.encryptHybrid(fileObj, publicKey, signingKey, updateItemProgress);
             finalBlob = encryptedBlob;
             finalName = 'JohnCrypt.enc';
           } else {
-            const { decryptedData, fileName } = await cryptoWorker.decryptHybrid(
+            const result = await cryptoWorker.decryptHybrid(
               fileObj, 
               privateKey, 
               verifyKey,
               updateItemProgress
             );
-            finalBlob = new Blob([decryptedData]);
-            finalName = fileName;
+            finalBlob = new Blob([result.decryptedData]);
+            finalName = result.fileName;
             sigVerified = !!verifyKey;
+            watermark = result.watermark || '';
           }
         }
 
         const durationMs = performance.now() - startTime;
 
-        // Represent as random numbers sequence or Hex matrix if selected during encryption
         if (mode === 'encrypt' && numericCipherType !== 'off' && finalBlob) {
           const arrayBuffer = await finalBlob.arrayBuffer();
           const bytes = new Uint8Array(arrayBuffer);
           const serialized = serializeToNumericString(bytes, numericCipherType);
-          finalBlob = new Blob([serialized], { type: 'application/octet-stream' });
-          finalName = 'JohnCrypt.enc';
+          finalBlob = new Blob([serialized], { type: 'text/plain' });
+          finalName = 'JohnCrypt.txt';
         }
 
-        // Auto download the processed file
-        try {
-          saveAs(finalBlob, finalName);
-        } catch (downloadErr) {
-          console.error('Auto download failed:', downloadErr);
-        }
+        if (finalBlob) {
+          setQueue(prev => prev.map(qItem => qItem.id === item.id ? { 
+            ...qItem, 
+            status: 'completed', 
+            progress: 100,
+            resultBlob: finalBlob as Blob,
+            resultName: finalName
+          } : qItem));
+          
+          if (totalItems === 1) {
+            setResult({ blob: finalBlob, name: finalName, signatureVerified: sigVerified, watermark });
+          }
 
-        successCount++;
-        setQueue(prev => prev.map(qItem => qItem.id === item.id ? { 
-          ...qItem, 
-          status: 'completed', 
-          progress: 100, 
-          resultBlob: finalBlob!, 
-          resultName: finalName, 
-          signatureVerified: sigVerified 
-        } : qItem));
-
-        const getAlgoName = (type: 'symmetric' | 'hybrid' | 'turbo') => {
-          if (type === 'turbo') return 'AES-256-GCM';
-          if (type === 'hybrid') return 'ECIES Hybrid (Curve25519)';
-          return 'Triple-Layer (AES+ChaCha)';
-        };
-
-        setRecentOperations(prev => [
-          {
-            id: `${item.id}-op-${Date.now()}`,
+          const newOp: RecentOperation = {
+            id: Math.random().toString(36).substring(7),
             fileName: item.file.name,
             fileSize: item.file.size,
             type: mode,
+            algorithm: cryptoType.toUpperCase(),
             timestamp: Date.now(),
-            status: 'success',
-            mode: cryptoType,
-            algorithm: getAlgoName(cryptoType),
-            durationMs,
-          },
-          ...prev
-        ]);
-
-        // If it's a single file, configure global result state so existing UI success-screens can render nicely if they want
-        if (totalItems === 1) {
-          setResult({
-            blob: finalBlob!,
-            name: finalName,
-            signatureVerified: sigVerified
-          });
+            durationMs
+          };
+          setRecentOperations(prev => [newOp, ...prev].slice(0, 50));
+          successCount++;
         }
-
       } catch (err: any) {
-        console.error(`Error processing file ${item.file.name}:`, err);
+        console.error('Processing error:', err);
+        const errorMsg = getErrorMessage(err);
+        setQueue(prev => prev.map(qItem => qItem.id === item.id ? { ...qItem, status: 'error', error: errorMsg } : qItem));
         failureCount++;
-        const errMsg = getErrorMessage(err);
-        setQueue(prev => prev.map(qItem => qItem.id === item.id ? { 
-          ...qItem, 
-          status: 'failed', 
-          progress: 0, 
-          error: errMsg 
-        } : qItem));
-        toast.error(`Failed to process ${item.file.name}: ${errMsg}`);
+        toast.error(`Failed to process ${item.file.name}: ${errorMsg}`);
       }
     }
 
     setIsProcessing(false);
     setProgress(100);
 
-    // Show overall status notifications and trigger confetti if any success
     if (successCount === totalItems) {
-      toast.success('All files processed successfully!');
       confetti({
-        particleCount: 100,
+        particleCount: 150,
         spread: 70,
         origin: { y: 0.6 },
-        colors: ['#3b82f6', '#8b5cf6', '#ec4899']
-      }).catch(err => console.error('Confetti error:', err));
+        colors: ['#22d3ee', '#3b82f6', '#10b981', '#f59e0b']
+      });
+      toast.success(totalItems > 1 ? `Successfully processed ${totalItems} files!` : 'File processed successfully!');
     } else if (successCount > 0) {
-      toast.success(`Batch complete: ${successCount} succeeded, ${failureCount} failed.`);
-      confetti({
-        particleCount: 50,
-        spread: 45,
-        origin: { y: 0.6 },
-        colors: ['#3b82f6', '#8b5cf6']
-      }).catch(err => console.error('Confetti error:', err));
-    } else {
-      toast.error('Job complete. No files were processed successfully.');
+      toast.success(`Processed ${successCount} files, but ${failureCount} failed.`);
     }
   };
 
-  const handleDownload = () => {
-    if (!result) return;
-    try {
-      saveAs(result.blob, result.name);
-    } catch (error) {
-      console.error('Download error:', error);
-      toast.error('Download failed. Please ensure downloads are enabled in your browser settings.');
+  const handleCopyResult = async () => {
+    if (result) {
+      try {
+        const text = await result.blob.text();
+        await navigator.clipboard.writeText(text);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+        toast.success('Ciphertext copied to clipboard!');
+      } catch (err) {
+        toast.error('Failed to copy result.');
+      }
     }
-  };
-
-  const copyPassword = async () => {
-    try {
-      await navigator.clipboard.writeText(password);
-      setCopied(true);
-      toast.success('Password copied to clipboard');
-      setTimeout(() => setCopied(false), 2000);
-    } catch (err) {
-      toast.error('Failed to copy password.');
-    }
-  };
-
-  const reset = () => {
-    setQueue([]);
-    setPassword('');
-    setResult(null);
-    setProgress(0);
   };
 
   return (
-    <div className="min-h-screen flex flex-col items-center justify-center p-4 md:p-8 relative">
-      <Toaster position="top-center" />
+    <div className="min-h-screen bg-[var(--bg-color)] text-[var(--text-main)] selection:bg-cyan-500/30 overflow-x-hidden font-sans transition-colors duration-500">
+      <Toaster position="top-right" />
       
+      {/* Dynamic Background */}
+      <div className="fixed inset-0 pointer-events-none z-0 overflow-hidden">
+        <div className="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] bg-cyan-500/10 blur-[120px] rounded-full animate-pulse" />
+        <div className="absolute bottom-[-10%] right-[-10%] w-[40%] h-[40%] bg-blue-500/10 blur-[120px] rounded-full animate-pulse" style={{ animationDelay: '1s' }} />
+        <div className="absolute inset-0 bg-[url('https://grainy-gradients.vercel.app/noise.svg')] opacity-20 mix-blend-overlay" />
+      </div>
+
       {/* Navigation */}
-      <nav className="fixed top-0 left-0 right-0 p-4 md:p-6 flex justify-between items-center z-50 bg-black/10 backdrop-blur-md border-b border-[var(--border-color)] shadow-[0_4px_30px_rgba(0,0,0,0.1)]">
-        <div className="flex items-center gap-3 drop-shadow-sm">
-          <Shield className="w-5 h-5 text-cyan-400" />
-          <span className="font-black tracking-tighter text-lg text-[var(--text-main)]">JohnCrypt</span>
-          <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 max-w-[140px] truncate" title="Device Identity Badge">
-            {deviceIdentity}
-          </span>
+      <nav className="relative z-50 flex items-center justify-between px-6 py-4 backdrop-blur-md border-b border-white/5 bg-black/5">
+        <div className="flex items-center gap-3 group cursor-pointer" onClick={() => window.location.reload()}>
+          <div className="relative">
+            <Shield className="w-8 h-8 text-cyan-400 drop-shadow-[0_0_8px_rgba(34,211,238,0.5)] transition-transform group-hover:scale-110" />
+            <div className="absolute inset-0 bg-cyan-400/20 blur-lg rounded-full animate-pulse" />
+          </div>
+          <div>
+            <span className="font-black tracking-tighter text-2xl bg-gradient-to-r from-white to-white/60 bg-clip-text text-transparent">JohnCrypt</span>
+            <div className="h-0.5 w-0 group-hover:w-full bg-cyan-400 transition-all duration-300" />
+          </div>
         </div>
-        <div className="flex items-center gap-1.5">
+
+        <div className="flex items-center gap-4">
+          <div className="hidden md:flex items-center gap-1 px-3 py-1.5 rounded-full bg-white/5 border border-white/10">
+            <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+            <span className="text-[10px] font-bold text-[var(--text-muted)] uppercase tracking-widest">{deviceIdentity}</span>
+          </div>
+          
           <button 
             onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
-            className="p-1.5 glass-button border border-[var(--border-color)] rounded-lg transition-all group shadow-[0_2px_10px_rgba(0,0,0,0.2)]"
-            title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}
+            className="p-2.5 rounded-xl hover:bg-white/10 transition-all glass-button border border-white/5"
           >
-            {theme === 'dark' ? (
-              <Sun className="w-4 h-4 text-[var(--text-muted)] group-hover:text-yellow-400 transition-colors drop-shadow-sm" />
-            ) : (
-              <Moon className="w-4 h-4 text-[var(--text-muted)] group-hover:text-blue-600 transition-colors drop-shadow-sm" />
-            )}
+            {theme === 'dark' ? <Sun className="w-5 h-5 text-amber-400" /> : <Moon className="w-5 h-5 text-blue-600" />}
           </button>
-          <button
+          
+          <button 
             onClick={() => setIsSidebarOpen(true)}
-            className="p-1.5 glass-button border border-[var(--border-color)] rounded-lg transition-all group shadow-[0_2px_10px_rgba(0,0,0,0.2)]"
+            className="p-2.5 rounded-xl hover:bg-white/10 transition-all glass-button border border-white/5 relative"
           >
-            <Menu className={cn("w-4 h-4 transition-colors drop-shadow-sm", theme === 'dark' ? "text-white/50 group-hover:text-white" : "text-black/50 group-hover:text-black")} />
+            <Menu className="w-5 h-5 text-cyan-400" />
+            {recentOperations.length > 0 && (
+              <span className="absolute top-1.5 right-1.5 w-2 h-2 bg-cyan-500 rounded-full border-2 border-[var(--bg-color)]" />
+            )}
           </button>
         </div>
       </nav>
 
+      <main className="relative z-10 max-w-6xl mx-auto px-6 py-12 md:py-20">
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-12 items-start">
+          {/* Left Column: Controls */}
+          <div className="lg:col-span-5 space-y-8">
+            <motion.div
+              initial={{ opacity: 0, x: -20 }}
+              animate={{ opacity: 1, x: 0 }}
+              className="space-y-4"
+            >
+              <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-cyan-500/10 border border-cyan-500/20 text-cyan-400 text-[10px] font-bold uppercase tracking-widest">
+                <Cpu className="w-3 h-3" /> 2026 Security Standard
+              </div>
+              <h1 className="text-4xl md:text-5xl font-black tracking-tight leading-tight">
+                Secure your data with <span className="text-cyan-400 drop-shadow-[0_0_15px_rgba(34,211,238,0.3)]">Zero-Knowledge</span> encryption.
+              </h1>
+              <p className="text-[var(--text-muted)] text-lg leading-relaxed max-w-md">
+                Military-grade file protection that runs entirely in your browser. Your password never leaves your device.
+              </p>
+            </motion.div>
+
+            <div className="space-y-6">
+              {/* Mode Switcher */}
+              <div className="p-1.5 bg-black/20 rounded-2xl border border-white/5 flex gap-1.5">
+                <button
+                  onClick={() => setMode('encrypt')}
+                  className={cn(
+                    "flex-1 py-3 rounded-xl text-xs font-bold uppercase tracking-widest transition-all duration-300",
+                    mode === 'encrypt' ? "bg-cyan-500 text-white shadow-[0_0_20px_rgba(6,182,212,0.4)]" : "text-[var(--text-muted)] hover:bg-white/5"
+                  )}
+                >
+                  Encrypt
+                </button>
+                <button
+                  onClick={() => setMode('decrypt')}
+                  className={cn(
+                    "flex-1 py-3 rounded-xl text-xs font-bold uppercase tracking-widest transition-all duration-300",
+                    mode === 'decrypt' ? "bg-blue-600 text-white shadow-[0_0_20px_rgba(37,99,235,0.4)]" : "text-[var(--text-muted)] hover:bg-white/5"
+                  )}
+                >
+                  Decrypt
+                </button>
+              </div>
+
+              {/* Crypto Type Selector */}
+              <div className="grid grid-cols-3 gap-3">
+                {[
+                  { id: 'symmetric', label: 'Symmetric', icon: <Key className="w-3.5 h-3.5" /> },
+                  { id: 'hybrid', label: 'Hybrid', icon: <Globe className="w-3.5 h-3.5" /> },
+                  { id: 'turbo', label: 'Turbo', icon: <Zap className="w-3.5 h-3.5" /> }
+                ].map((type) => (
+                  <button
+                    key={type.id}
+                    onClick={() => setCryptoType(type.id as any)}
+                    className={cn(
+                      "flex flex-col items-center gap-2 p-4 rounded-2xl border transition-all duration-300",
+                      cryptoType === type.id 
+                        ? "bg-white/5 border-cyan-500/50 text-cyan-400 shadow-[inset_0_0_20px_rgba(6,182,212,0.1)]" 
+                        : "bg-transparent border-white/5 text-[var(--text-muted)] hover:border-white/20"
+                    )}
+                  >
+                    {type.icon}
+                    <span className="text-[10px] font-bold uppercase tracking-wider">{type.label}</span>
+                  </button>
+                ))}
+              </div>
+
+              {/* Input Section */}
+              <div className="space-y-4">
+                {cryptoType === 'hybrid' ? (
+                  <div className="space-y-4 animate-in fade-in slide-in-from-bottom-2">
+                    {mode === 'encrypt' ? (
+                      <div className="space-y-2">
+                        <label className="text-[10px] font-bold uppercase tracking-widest text-[var(--text-muted)] flex items-center gap-2">
+                          Recipient Public Key (JWK)
+                          <InfoTooltip content="Paste the public key of the person who will decrypt this file." />
+                        </label>
+                        <textarea
+                          value={publicKey}
+                          onChange={(e) => setPublicKey(e.target.value)}
+                          placeholder='{"kty":"RSA",...}'
+                          className="w-full h-24 bg-black/20 border border-white/10 rounded-2xl p-4 text-[10px] font-mono focus:border-cyan-500/50 outline-none transition-all resize-none custom-scrollbar"
+                        />
+                      </div>
+                    ) : (
+                      <div className="space-y-2">
+                        <label className="text-[10px] font-bold uppercase tracking-widest text-[var(--text-muted)] flex items-center gap-2">
+                          Your Private Key (JWK)
+                          <InfoTooltip content="Your secret private key is required to decrypt hybrid-encrypted files." />
+                        </label>
+                        <textarea
+                          value={privateKey}
+                          onChange={(e) => setPrivateKey(e.target.value)}
+                          placeholder='{"kty":"RSA",...}'
+                          className="w-full h-24 bg-black/20 border border-white/10 rounded-2xl p-4 text-[10px] font-mono focus:border-blue-500/50 outline-none transition-all resize-none custom-scrollbar"
+                        />
+                      </div>
+                    )}
+                    
+                    <div className="flex gap-3">
+                      <button
+                        onClick={handleGenerateKeys}
+                        disabled={isGeneratingKeys}
+                        className="flex-1 py-3 px-4 bg-white/5 border border-white/10 rounded-xl text-[10px] font-bold uppercase tracking-widest hover:bg-white/10 transition-all disabled:opacity-50"
+                      >
+                        {isGeneratingKeys ? 'Generating...' : 'Generate New Keypair'}
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <PasswordInput 
+                    password={password} 
+                    setPassword={setPassword}
+                    mode={mode}
+                  />
+                )}
+              </div>
+
+              {/* Action Button */}
+              <button
+                onClick={handleProcess}
+                disabled={isProcessing || queue.length === 0}
+                className={cn(
+                  "w-full py-4 rounded-2xl text-sm font-black uppercase tracking-[0.2em] transition-all duration-500 flex items-center justify-center gap-3 relative overflow-hidden group",
+                  mode === 'encrypt' 
+                    ? "bg-cyan-500 text-white shadow-[0_10px_30px_rgba(6,182,212,0.3)] hover:shadow-[0_15px_40px_rgba(6,182,212,0.4)]" 
+                    : "bg-blue-600 text-white shadow-[0_10px_30px_rgba(37,99,235,0.3)] hover:shadow-[0_15px_40px_rgba(37,99,235,0.4)]",
+                  "disabled:opacity-50 disabled:cursor-not-allowed disabled:shadow-none"
+                )}
+              >
+                <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/20 to-transparent -translate-x-full group-hover:translate-x-full transition-transform duration-1000" />
+                {isProcessing ? (
+                  <>
+                    <RefreshCw className="w-5 h-5 animate-spin" />
+                    Processing... {progress}%
+                  </>
+                ) : (
+                  <>
+                    {mode === 'encrypt' ? <Shield className="w-5 h-5" /> : <ShieldCheck className="w-5 h-5" />}
+                    {mode === 'encrypt' ? 'Secure Files Now' : 'Unlock Data'}
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+
+          {/* Right Column: Dropzone & Results */}
+          <div className="lg:col-span-7 space-y-6">
+            <div className="relative group">
+              <div className="absolute -inset-1 bg-gradient-to-r from-cyan-500 to-blue-600 rounded-[2rem] blur opacity-20 group-hover:opacity-40 transition duration-1000" />
+              <div className="relative bg-[var(--card-bg)] border border-white/5 rounded-[2rem] overflow-hidden shadow-2xl">
+                <FileDropZone 
+                  onFilesSelect={handleFilesSelect} 
+                  queue={queue}
+                  onRemoveItem={handleRemoveItem}
+                  onClearQueue={handleClearQueue}
+                  isProcessing={isProcessing}
+                />
+              </div>
+            </div>
+
+            <AnimatePresence>
+              {result && (
+                <motion.div
+                  initial={{ opacity: 0, y: 20 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -20 }}
+                  className="space-y-4"
+                >
+                  <div className="p-6 bg-black/20 rounded-3xl border border-white/5 backdrop-blur-xl">
+                    <div className="flex items-center justify-between mb-6">
+                      <div className="flex items-center gap-3">
+                        <div className="w-10 h-10 rounded-xl bg-emerald-500/20 flex items-center justify-center border border-emerald-500/30">
+                          <Check className="w-6 h-6 text-emerald-400" />
+                        </div>
+                        <div>
+                          <h3 className="text-sm font-bold">Process Complete</h3>
+                          <p className="text-[10px] text-[var(--text-muted)] uppercase tracking-widest">Ready for secure preview</p>
+                        </div>
+                      </div>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={handleCopyResult}
+                          className="p-2.5 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 transition-all group"
+                          title="Copy Ciphertext"
+                        >
+                          {copied ? <Check className="w-5 h-5 text-emerald-400" /> : <Copy className="w-5 h-5 text-[var(--text-muted)] group-hover:text-white" />}
+                        </button>
+                        <button
+                          onClick={() => saveAs(result.blob, result.name)}
+                          className="flex items-center gap-2 px-5 py-2.5 bg-cyan-500 hover:bg-cyan-400 text-white rounded-xl text-xs font-black uppercase tracking-widest transition-all shadow-lg shadow-cyan-500/20"
+                        >
+                          <Download className="w-4 h-4" /> Download
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="aspect-square md:aspect-video w-full max-w-full">
+                      <FilePreview 
+                        file={result.blob} 
+                        fileName={result.name} 
+                        isEncryptedSource={mode === 'encrypt'}
+                      />
+                    </div>
+                    
+                    {result.signatureVerified && (
+                      <div className="mt-4 flex items-center gap-2 px-4 py-2 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-[10px] font-bold uppercase tracking-widest">
+                        <ShieldCheck className="w-4 h-4" /> Digital Signature Verified (RSA-4096-PSS)
+                      </div>
+                    )}
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
+        </div>
+      </main>
+
+      {/* Footer */}
+      <footer className="relative z-10 py-12 border-t border-white/5 bg-black/5">
+        <div className="max-w-6xl mx-auto px-6 flex flex-col md:flex-row justify-between items-center gap-8">
+          <div className="flex items-center gap-6">
+            <a href="#" className="text-[var(--text-muted)] hover:text-white transition-colors"><Github className="w-5 h-5" /></a>
+            <a href="#" className="text-[var(--text-muted)] hover:text-white transition-colors"><Mail className="w-5 h-5" /></a>
+            <a href="#" className="text-[var(--text-muted)] hover:text-white transition-colors"><MessageCircle className="w-5 h-5" /></a>
+          </div>
+          
+          <div className="flex items-center gap-8">
+            <button onClick={() => setIsAboutOpen(true)} className="text-[10px] font-bold uppercase tracking-[0.2em] text-[var(--text-muted)] hover:text-cyan-400 transition-colors">Security Architecture</button>
+            <span className="text-[10px] font-bold uppercase tracking-[0.2em] text-white/20">© 2026 JohnCrypt</span>
+          </div>
+        </div>
+      </footer>
+
       <Sidebar 
         isOpen={isSidebarOpen} 
-        onClose={() => setIsSidebarOpen(false)} 
+        onClose={() => setIsSidebarOpen(false)}
         onOpenAbout={() => {
           setIsSidebarOpen(false);
           setIsAboutOpen(true);
@@ -554,473 +746,13 @@ export default function App() {
         setArgon2Settings={setArgon2Settings}
         onGenerateSymmetricKey={handleGenerateSymmetricKey}
         recentOperations={recentOperations}
-        onClearRecentOperations={() => {
-          setRecentOperations([]);
-          toast.success('Recent Operations history cleared!');
-        }}
+        onClearRecentOperations={() => setRecentOperations([])}
       />
-      
+
       <AboutModal 
         isOpen={isAboutOpen} 
         onClose={() => setIsAboutOpen(false)} 
       />
-      
-      {/* Background Elements (Optimized out heavy multi-layer blur filters for 100% smooth frame-rate) */}
-
-      {/* Header */}
-      <motion.header 
-        initial={{ opacity: 0, y: -20, rotateX: 10 }}
-        animate={{ opacity: 1, y: 0, rotateX: 0 }}
-        transition={{ duration: 0.8, type: "spring" }}
-        className="text-center mb-12 relative z-10 perspective-1000"
-      >
-        <h1 className={cn(
-          "text-6xl md:text-[5.5rem] font-black tracking-tighter mb-4 transition-colors duration-300 drop-shadow-2xl",
-          theme === 'dark' ? "text-white" : "text-slate-800"
-        )}>
-          JohnCrypt
-        </h1>
-      </motion.header>
-
-      {/* Main Container */}
-      <main className="w-full max-w-xl lg:max-w-5xl relative z-10 perspective-1000">
-        <motion.div 
-          initial={{ opacity: 0, y: 20, rotateX: 10 }}
-          animate={{ opacity: 1, y: 0, rotateX: 0 }}
-          transition={{ duration: 0.5, ease: "easeOut" }}
-          className="glass-card p-6 md:p-8 lg:p-10 space-y-8"
-        >
-          {/* Crypto Type Switcher */}
-          <div className="flex p-1 glass-card rounded-2xl">
-            <button
-              onClick={() => setCryptoType('symmetric')}
-              className={cn(
-                "flex-1 py-2 rounded-xl text-[10px] md:text-xs font-bold transition-all duration-300 flex items-center justify-center gap-1.5",
-                cryptoType === 'symmetric' 
-                  ? "glass-button text-cyan-400 shadow-lg" 
-                  : "text-[var(--text-muted)] hover:text-[var(--text-main)]"
-              )}
-            >
-              Symmetric
-              <InfoTooltip content="Uses a password to derive a key for Triple-Layer encryption (AES-256 + ChaCha20 + XChaCha20). Updated to V8 with Ultra-Hardened Argon2id settings." />
-            </button>
-            <button
-              onClick={() => setCryptoType('turbo')}
-              className={cn(
-                "flex-1 py-2 rounded-xl text-[10px] md:text-xs font-bold transition-all duration-300 flex items-center justify-center gap-1.5",
-                cryptoType === 'turbo' 
-                  ? "glass-button text-emerald-400 shadow-lg" 
-                  : "text-[var(--text-muted)] hover:text-[var(--text-main)]"
-              )}
-            >
-              Turbo (GCM)
-              <InfoTooltip content="Uses 100% hardware-accelerated AES-256-GCM + PBKDF2. Near-instant processing (exceeding 2.5 Gbps) under strict browser resource constraints." />
-            </button>
-            <button
-              onClick={() => setCryptoType('hybrid')}
-              className={cn(
-                "flex-1 py-2 rounded-xl text-[10px] md:text-xs font-bold transition-all duration-300 flex items-center justify-center gap-1.5",
-                cryptoType === 'hybrid' 
-                  ? "glass-button text-blue-400 shadow-lg" 
-                  : "text-[var(--text-muted)] hover:text-[var(--text-main)]"
-              )}
-            >
-              Hybrid
-              <InfoTooltip content="Uses Triple-Hybrid (RSA-4096 + ECDH-P521 + Kyber-1024) for secure key exchange and digital signatures. Post-Quantum Ready." />
-            </button>
-          </div>
-
-          {/* Mode Switcher */}
-          <div className="flex p-1 glass-card rounded-2xl">
-            <button
-              onClick={() => { setMode('encrypt'); reset(); }}
-              className={cn(
-                "flex-1 py-3 rounded-xl text-sm font-bold transition-all duration-300 flex items-center justify-center gap-2",
-                mode === 'encrypt' ? "bg-cyan-500/20 text-cyan-400 border border-cyan-500/30 shadow-[0_0_15px_rgba(6,182,212,0.3)]" : "text-[var(--text-muted)] hover:text-[var(--text-main)]"
-              )}
-            >
-              <Shield className="w-4 h-4" />
-              Encrypt
-            </button>
-            <button
-              onClick={() => { setMode('decrypt'); reset(); }}
-              className={cn(
-                "flex-1 py-3 rounded-xl text-sm font-bold transition-all duration-300 flex items-center justify-center gap-2",
-                mode === 'decrypt' ? "bg-blue-500/20 text-blue-400 border border-blue-500/30 shadow-[0_0_15px_rgba(59,130,246,0.3)]" : "text-[var(--text-muted)] hover:text-[var(--text-main)]"
-              )}
-            >
-              <ShieldCheck className="w-4 h-4" />
-              Decrypt
-            </button>
-          </div>
-
-          <AnimatePresence mode="wait">
-            {!result ? (
-              <motion.div 
-                key="input-form"
-                initial={{ opacity: 0, x: -20 }}
-                animate={{ opacity: 1, x: 0 }}
-                exit={{ opacity: 0, x: 20 }}
-                className="space-y-6 lg:space-y-0 lg:grid lg:grid-cols-12 lg:gap-8 text-left"
-              >
-                {/* Left Side Column: Dropping area, queue, and single file previews */}
-                <div className="lg:col-span-7 space-y-6 flex flex-col justify-start">
-                  <FileDropZone 
-                    onFilesSelect={handleFilesSelect} 
-                    queue={queue} 
-                    onRemoveItem={handleRemoveItem} 
-                    onClearQueue={handleClearQueue} 
-                    isProcessing={isProcessing}
-                    onDownloadItem={handleDownloadItem}
-                  />
-                  
-                  {queue.length === 1 && <FilePreview file={queue[0].file} />}
-                </div>
-
-                {/* Right Side Column: Configuring credential keys, passwords, output types, and process actions */}
-                <div className="lg:col-span-5 space-y-6 flex flex-col justify-between">
-                  <div className="space-y-6">
-                    {cryptoType === 'symmetric' || cryptoType === 'turbo' ? (
-                      <div className="space-y-4">
-                        <PasswordInput 
-                          value={password} 
-                          onChange={setPassword} 
-                          placeholder={mode === 'encrypt' ? "Create a strong password" : "Enter decryption password"}
-                        />
-                        
-                        {password && mode === 'encrypt' && (
-                          <button
-                            onClick={copyPassword}
-                            className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest text-[var(--text-muted)] hover:text-blue-400 transition-colors ml-auto"
-                          >
-                            {copied ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
-                            {copied ? "Copied" : "Copy Password"}
-                          </button>
-                        )}
-                      </div>
-                    ) : (
-                      <div className="space-y-6">
-                        {/* Public Key Slot (Encryption or Verification) */}
-                        <div className="space-y-2">
-                          <div className="flex justify-between items-center">
-                            <label className="text-[10px] font-bold uppercase tracking-widest text-[var(--text-muted)] flex items-center gap-2 drop-shadow-sm">
-                              <Shield className={cn("w-3 h-3", mode === 'encrypt' ? "text-cyan-400" : "text-emerald-400")} />
-                              {mode === 'encrypt' ? 'Public Encryption Key' : 'Public Verification Key (Optional)'}
-                              <InfoTooltip content={mode === 'encrypt' ? "The recipient's public key used to encrypt the file. Safe to share." : "The sender's public key used to verify the digital signature."} />
-                            </label>
-                            <div className="flex gap-3">
-                              <button 
-                                onClick={async () => {
-                                  let textToCopy = '';
-                                  if (mode === 'encrypt') {
-                                    if (publicKey) textToCopy += `Public Encryption Key:\n${publicKey}\n\n`;
-                                    if (signingKey) textToCopy += `Private Signing Key:\n${signingKey}`;
-                                  } else {
-                                    if (verifyKey) textToCopy += `Public Verification Key:\n${verifyKey}\n\n`;
-                                    if (privateKey) textToCopy += `Private Decryption Key:\n${privateKey}`;
-                                  }
-                                  
-                                  if (textToCopy) {
-                                    try {
-                                      await navigator.clipboard.writeText(textToCopy.trim());
-                                      toast.success('Keys copied!');
-                                    } catch (err) {
-                                      toast.error('Failed to copy keys.');
-                                    }
-                                  } else {
-                                    toast.error('No keys to copy.');
-                                  }
-                                }}
-                                className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-widest text-emerald-400 hover:text-emerald-300 transition-colors drop-shadow-sm"
-                              >
-                                <Copy className="w-3 h-3" />
-                                Copy Keys
-                              </button>
-                              <button 
-                                onClick={handleGenerateKeys}
-                                disabled={isGeneratingKeys}
-                                className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-widest text-cyan-400 hover:text-cyan-300 disabled:opacity-50 transition-colors drop-shadow-sm"
-                              >
-                                <RefreshCw className={cn("w-3 h-3", isGeneratingKeys && "animate-spin")} />
-                                {isGeneratingKeys ? 'Generating...' : 'New Pair'}
-                              </button>
-                            </div>
-                          </div>
-                          <input
-                            type="text"
-                            value={mode === 'encrypt' ? publicKey : verifyKey}
-                            onChange={(e) => mode === 'encrypt' ? setPublicKey(e.target.value) : setVerifyKey(e.target.value)}
-                            placeholder={mode === 'encrypt' ? "Paste Recipient's Public Encryption Key (JWK) here..." : "Paste Sender's Public Verification Key (JWK) here..."}
-                            className="w-full glass-card border border-[var(--border-color)] rounded-xl py-2.5 px-4 text-sm text-[var(--text-main)] placeholder:text-[var(--text-muted)] focus:outline-none focus:ring-2 focus:ring-cyan-500/50 focus:border-cyan-500/50 transition-all shadow-[inset_0_2px_10px_rgba(0,0,0,0.1)]"
-                          />
-                        </div>
-
-                        {/* Private Key Slot (Decryption or Signing) */}
-                        <div className="space-y-2">
-                          <div className="flex justify-between items-center">
-                            <label className="text-[10px] font-bold uppercase tracking-widest text-[var(--text-muted)] flex items-center gap-2 drop-shadow-sm">
-                              <Key className={cn("w-3 h-3", mode === 'encrypt' ? "text-emerald-400" : "text-cyan-400")} />
-                              {mode === 'encrypt' ? 'Private Signing Key (Optional)' : 'Private Decryption Key'}
-                              <InfoTooltip content={mode === 'encrypt' ? "Your private key used to digitally sign the file. Keep this secret!" : "Your private key used to decrypt the file. Keep this secret!"} />
-                            </label>
-                          </div>
-                          <input
-                            type="text"
-                            value={mode === 'encrypt' ? signingKey : privateKey}
-                            onChange={(e) => mode === 'encrypt' ? setSigningKey(e.target.value) : setPrivateKey(e.target.value)}
-                            placeholder={mode === 'encrypt' ? "Paste Your Private Signing Key (JWK) here..." : "Paste Your Private Decryption Key (JWK) here..."}
-                            className="w-full glass-card border border-[var(--border-color)] rounded-xl py-2.5 px-4 text-sm text-[var(--text-main)] placeholder:text-[var(--text-muted)] focus:outline-none focus:ring-2 focus:ring-cyan-500/50 focus:border-cyan-500/50 transition-all shadow-[inset_0_2px_10px_rgba(0,0,0,0.1)]"
-                          />
-                        </div>
-                      </div>
-                    )}
-
-                    {mode === 'encrypt' && (
-                      <motion.div 
-                        initial={{ opacity: 0, height: 0 }}
-                        animate={{ opacity: 1, height: 'auto' }}
-                        className="flex flex-col gap-3 p-4 rounded-2xl border border-[var(--border-color)] bg-black/15 backdrop-blur-sm shadow-[inset_0_1px_5px_rgba(255,255,255,0.03)] overflow-hidden text-left"
-                      >
-                        <div className="flex flex-col gap-0.5">
-                          <span className="text-xs font-bold text-[var(--text-main)] flex items-center gap-1.5 drop-shadow-sm justify-between">
-                            <span className="flex items-center gap-1.5">
-                              Output Cipher Layout
-                              <InfoTooltip content="Mengubah output biner hasil enkripsi menjadi deretan digit angka desimal acak (0-255) atau matriks heksadesimal (Cyber Hex) yang tersimpan dalam format teks plain. JohnCrypt akan mendeteksinya secara otomatis sewaktu didekripsi." />
-                            </span>
-                            <span className="text-[10px] text-cyan-400 font-mono font-bold tracking-widest uppercase bg-cyan-950/40 px-2.5 py-0.5 rounded border border-cyan-500/20 shadow-[0_0_8px_rgba(6,182,212,0.15)]">
-                              {numericCipherType === 'off' ? 'BINARY FILE' : numericCipherType === 'decimal' ? 'DECIMAL STRINGS' : 'CYBER HEX MATRIX'}
-                            </span>
-                          </span>
-                          <span className="text-[10px] text-[var(--text-muted)] mt-0.5">Choose how the encrypted cipher data physically structures its output streams</span>
-                        </div>
-                        
-                        {/* Segmented Controller Options */}
-                        <div className="grid grid-cols-3 gap-2 p-1 rounded-xl bg-black/35 border border-white/5 shadow-inner">
-                          <button
-                            type="button"
-                            onClick={() => setNumericCipherType('off')}
-                            className={cn(
-                              "py-2 px-1 rounded-lg text-[10px] font-mono font-bold uppercase tracking-wider transition-all duration-350 flex flex-col items-center gap-1 border cursor-pointer",
-                              numericCipherType === 'off'
-                                ? "bg-white/5 border-white/10 text-white shadow"
-                                : "border-transparent text-[var(--text-muted)] hover:text-white hover:bg-white/5"
-                            )}
-                          >
-                            <Shield className="w-3.5 h-3.5 text-blue-400" />
-                            Binary
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setNumericCipherType('decimal')}
-                            className={cn(
-                              "py-2 px-1 rounded-lg text-[10px] font-mono font-bold uppercase tracking-wider transition-all duration-350 flex flex-col items-center gap-1 border cursor-pointer",
-                              numericCipherType === 'decimal'
-                                ? "bg-cyan-500/10 border-cyan-500/20 text-cyan-400 shadow-[0_0_10px_rgba(6,182,212,0.15)]"
-                                : "border-transparent text-[var(--text-muted)] hover:text-cyan-400 hover:bg-cyan-500/5"
-                            )}
-                          >
-                            <span className="text-xs">🔢</span>
-                            Decimal
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setNumericCipherType('hex')}
-                            className={cn(
-                              "py-2 px-1 rounded-lg text-[10px] font-mono font-bold uppercase tracking-wider transition-all duration-350 flex flex-col items-center gap-1 border cursor-pointer",
-                              numericCipherType === 'hex'
-                                ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-400 shadow-[0_0_10px_rgba(16,185,129,0.15)]"
-                                : "border-transparent text-[var(--text-muted)] hover:text-emerald-400 hover:bg-[#10b981]/5"
-                            )}
-                          >
-                            <span className="text-xs">💻</span>
-                            Hex Cyber
-                          </button>
-                        </div>
-                      </motion.div>
-                    )}
-                  </div>
-
-                  <div className="pt-4 lg:pt-0">
-                    <button
-                      onClick={isProcessing ? undefined : handleProcess}
-                      disabled={
-                        !isProcessing && (
-                          queue.length === 0 || 
-                          ((cryptoType === 'symmetric' || cryptoType === 'turbo') && !password) || 
-                          (cryptoType === 'hybrid' && mode === 'encrypt' && !publicKey) || 
-                          (cryptoType === 'hybrid' && mode === 'decrypt' && !privateKey)
-                        )
-                      }
-                      className={cn(
-                        "w-full py-4 rounded-2xl font-black uppercase tracking-[0.2em] text-sm glass-button disabled:opacity-50 disabled:cursor-not-allowed transition-all relative overflow-hidden",
-                        isProcessing 
-                          ? "cursor-wait border-cyan-500/30 text-cyan-400 shadow-[0_0_25px_rgba(6,182,212,0.3)] bg-cyan-950/20" 
-                          : mode === 'encrypt' 
-                            ? "text-cyan-400 hover:text-cyan-300 hover:shadow-[0_0_30px_rgba(6,182,212,0.4)]" 
-                            : "text-blue-400 hover:text-blue-300 hover:shadow-[0_0_30px_rgba(59,130,246,0.4)]"
-                      )}
-                    >
-                      {isProcessing && (
-                        <motion.div
-                          className="absolute inset-y-0 left-0 bg-cyan-500/20"
-                          style={{ width: `${progress}%` }}
-                          initial={{ width: 0 }}
-                          animate={{ width: `${progress}%` }}
-                          transition={{ type: 'spring', bounce: 0, duration: 0.1 }}
-                        />
-                      )}
-                      
-                      <span className="relative z-10 flex items-center justify-center gap-2">
-                        {isProcessing ? (
-                          <>
-                            <RefreshCw className="w-4 h-4 animate-spin text-cyan-400" />
-                            <span>Processing... {Math.round(progress)}%</span>
-                          </>
-                        ) : (
-                          queue.length > 1 
-                            ? (mode === 'encrypt' ? "Secure Batch" : "Unlock Batch") 
-                            : (mode === 'encrypt' ? "Secure File" : "Unlock File")
-                        )}
-                      </span>
-                    </button>
-                  </div>
-                </div>
-              </motion.div>
-            ) : (
-              <motion.div 
-                key="result-card"
-                initial={{ opacity: 0, scale: 0.9 }}
-                animate={{ opacity: 1, scale: 1 }}
-                className="py-4 space-y-6 lg:space-y-0 lg:grid lg:grid-cols-12 lg:gap-8 text-left"
-              >
-                {/* Visual Feedback Pane on the Left */}
-                <div className="lg:col-span-7 flex flex-col justify-start">
-                  {mode === 'decrypt' && result.blob ? (
-                    <div className="space-y-2 text-left">
-                      <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-[var(--text-muted)] drop-shadow-sm mb-1 text-center lg:text-left font-mono">
-                        🔒 Decrypted Media Preview (Watermarked Sandbox)
-                      </p>
-                      <FilePreview file={result.blob} fileName={result.name} />
-                    </div>
-                  ) : (
-                    /* Secure diagnostic summary showing active protection layers to cover non-decrypted layouts gracefully */
-                    <div className="glass-card p-6 md:p-8 border border-[var(--border-color)] rounded-3xl space-y-6 bg-black/20 text-left h-full flex flex-col justify-center">
-                      <div className="flex items-center gap-3.5 border-b border-[var(--border-color)] pb-4">
-                        <div className="w-12 h-12 rounded-xl bg-cyan-500/10 border border-cyan-500/20 flex items-center justify-center">
-                          <Shield className="w-6 h-6 text-cyan-400 drop-shadow-md" />
-                        </div>
-                        <div>
-                          <p className="text-[10px] font-bold text-[var(--text-muted)] uppercase tracking-widest font-mono">Secure Shield Status</p>
-                          <p className="text-sm font-black text-[var(--text-main)] uppercase drop-shadow-sm">Active Symmetric Crypt</p>
-                        </div>
-                      </div>
-                      
-                      <div className="space-y-3.5 text-xs text-[var(--text-muted)]">
-                        <div className="flex items-center justify-between p-3 rounded-2xl bg-black/25 border border-white/5 shadow-inner">
-                          <span className="font-mono text-[10px] text-zinc-300">Total Secure Layers</span>
-                          <span className="text-cyan-400 font-bold font-mono text-[10px] tracking-wider uppercase bg-cyan-950/40 px-2 py-0.5 rounded border border-cyan-500/20">3 / 3 STACK SECURED</span>
-                        </div>
-                        <div className="flex items-center justify-between p-3 rounded-2xl bg-black/25 border border-white/5 shadow-inner">
-                          <span className="font-mono text-[10px] text-zinc-300">Integrity Protection</span>
-                          <span className="text-emerald-400 font-bold font-mono text-[10px] tracking-wider uppercase bg-emerald-950/40 px-2 py-0.5 rounded border border-emerald-500/20">SHA-512 SIGNED</span>
-                        </div>
-                        <div className="flex items-center justify-between p-3 rounded-2xl bg-black/25 border border-white/5 shadow-inner">
-                          <span className="font-mono text-[10px] text-zinc-300">Digital Watermarking</span>
-                          <span className="text-purple-400 font-bold font-mono text-[10px] tracking-wider uppercase bg-purple-950/40 px-2 py-0.5 rounded border border-purple-500/20 font-serif lowercase">©john_tamvan</span>
-                        </div>
-                      </div>
-                      <p className="text-[10px] text-[var(--text-muted)] leading-relaxed italic opacity-75 text-center lg:text-left">
-                        Secured completely within the local Web Crypto sandbox. No bytes or metadata have left your device identity.
-                      </p>
-                    </div>
-                  )}
-                </div>
-
-                {/* Secure Summary and Downloads on the Right */}
-                <div className="lg:col-span-5 flex flex-col justify-center items-center text-center space-y-6">
-                  <div className="w-24 h-24 rounded-full bg-emerald-500/20 flex items-center justify-center border border-emerald-500/30 shadow-[inset_0_2px_10px_rgba(16,185,129,0.3)]">
-                    <ShieldCheck className="w-12 h-12 text-emerald-400 drop-shadow-md" />
-                  </div>
-                  
-                  <div>
-                    <h3 className="text-2xl font-bold mb-2 drop-shadow-sm">Success!</h3>
-                    <p className="text-[var(--text-muted)] text-sm drop-shadow-sm">Your file is ready for download.</p>
-                  </div>
-                  
-                  {result.signatureVerified && (
-                    <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-xs font-medium">
-                      <Check className="w-3.5 h-3.5" />
-                      Digital Signature Verified
-                    </div>
-                  )}
-                  
-                  <div className="glass-card p-4 flex items-center justify-between gap-4 border border-[var(--border-color)] shadow-[0_10px_30px_rgba(0,0,0,0.5)] w-full">
-                    <div className="text-left overflow-hidden">
-                      <p className="text-xs font-bold text-[var(--text-muted)] uppercase tracking-widest mb-1 drop-shadow-sm">Result File</p>
-                      <p className="text-sm font-medium truncate text-cyan-400 drop-shadow-sm">{result.name}</p>
-                    </div>
-                    <button
-                      onClick={handleDownload}
-                      className="p-3 glass-button rounded-xl hover:scale-110 transition-transform shadow-[0_0_15px_rgba(6,182,212,0.3)] text-cyan-400"
-                    >
-                      <Download className="w-5 h-5 drop-shadow-md" />
-                    </button>
-                  </div>
-
-                  <button
-                    onClick={reset}
-                    className="flex items-center gap-2 text-xs font-bold uppercase tracking-widest text-[var(--text-muted)] hover:text-[var(--text-main)] transition-colors mx-auto drop-shadow-sm"
-                  >
-                    <RefreshCw className="w-4 h-4" />
-                    Process another file
-                  </button>
-                </div>
-              </motion.div>
-            )}
-          </AnimatePresence>
-        </motion.div>
-      </main>
-
-
-
-      {/* Footer */}
-      <footer className="mt-12 text-center space-y-6 relative z-10">
-        <div className="flex items-center justify-center gap-6">
-          <a 
-            href="https://github.com/THENASUKASUSU" 
-            target="_blank" 
-            rel="noopener noreferrer"
-            className="text-[var(--text-muted)] hover:text-[var(--text-main)] transition-colors"
-          >
-            <Github className="w-5 h-5" />
-          </a>
-          <a 
-            href="mailto:thenahamil@gmail.com" 
-            className="text-[var(--text-muted)] hover:text-[var(--text-main)] transition-colors"
-            title="Contact via Email"
-          >
-            <Mail className="w-5 h-5" />
-          </a>
-          <a 
-            href="https://wa.me/6282293087868?text=hello+bro,+add+new+feature" 
-            target="_blank" 
-            rel="noopener noreferrer"
-            className="text-[var(--text-muted)] hover:text-[var(--text-main)] transition-colors"
-            title="Contact via WhatsApp"
-          >
-            <MessageCircle className="w-5 h-5" />
-          </a>
-          <button 
-            onClick={() => setIsAboutOpen(true)}
-            className="text-[var(--text-muted)] hover:text-[var(--text-main)] transition-colors"
-          >
-            <Info className="w-5 h-5" />
-          </button>
-        </div>
-        <p className="text-[10px] font-bold uppercase tracking-[0.3em] text-[var(--text-muted)] opacity-50 flex items-center justify-center gap-1.5 flex-wrap">
-          &copy; 2026 <span className="font-serif italic text-xs tracking-normal text-cyan-400 normal-case drop-shadow-[0_0_10px_rgba(6,182,212,0.4)]">John</span> ✍️ • No Data Stored
-        </p>
-      </footer>
     </div>
   );
 }
