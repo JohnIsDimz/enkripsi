@@ -43,7 +43,7 @@ const HMAC_SIZE = 64; // HMAC-SHA-512
 
 // Header constants
 const MAGIC_BYTES = new TextEncoder().encode('THNA'); // ThenaCrypt Magic
-const VERSION = 9; // Version 9 (Argon2 settings written inside Header)
+const VERSION = 10; // Version 10 (Watermark & Enhanced Cascade)
 
 export class CryptoError extends Error {
   constructor(message: string, public code: string) {
@@ -158,23 +158,13 @@ export async function deriveSubKeys(masterKey: Uint8Array, salt: Uint8Array, ver
     return new Uint8Array(bits);
   };
 
-  if (version === 8 || version === 9) {
+  if (version >= 8) {
     return {
-      aesKey: await derive('THENACRYPT-AES-LAYER-V8'),
-      chachaKey: await derive('THENACRYPT-CHACHA-LAYER-V8'),
-      xChachaKey: await derive('THENACRYPT-XCHACHA-LAYER-V8'),
-      hmacKey: await derive('THENACRYPT-HMAC-AUTH-V8'),
-      metaKey: await derive('THENACRYPT-METADATA-V8')
-    };
-  }
-
-  if (version === 7) {
-    return {
-      aesKey: await derive('THENACRYPT-AES-LAYER-V3'),
-      chachaKey: await derive('THENACRYPT-CHACHA-LAYER-V3'),
-      xChachaKey: await derive('THENACRYPT-XCHACHA-LAYER-V3'),
-      hmacKey: await derive('THENACRYPT-HMAC-AUTH-V3'),
-      metaKey: await derive('THENACRYPT-METADATA-V3')
+      aesKey: await derive(`THENACRYPT-AES-LAYER-V${version}`),
+      chachaKey: await derive(`THENACRYPT-CHACHA-LAYER-V${version}`),
+      xChachaKey: await derive(`THENACRYPT-XCHACHA-LAYER-V${version}`),
+      hmacKey: await derive(`THENACRYPT-HMAC-AUTH-V${version}`),
+      metaKey: await derive(`THENACRYPT-METADATA-V${version}`)
     };
   }
 
@@ -221,7 +211,6 @@ export async function encryptFile(
 ): Promise<Blob> {
   let fileData: ArrayBuffer | null = null;
   let masterKey: Uint8Array | null = null;
-  let decryptedMetaBuffer: ArrayBuffer | null = null;
   
   try {
     const salt = self.crypto.getRandomValues(new Uint8Array(SALT_LENGTH));
@@ -240,8 +229,14 @@ export async function encryptFile(
     masterKey.fill(0);
     masterKey = null;
 
-    // 1. Encrypt Metadata (Filename, Size)
-    const metadata = JSON.stringify({ name: file.name, size: file.size, type: file.type });
+    // 1. Encrypt Metadata (Filename, Size, Watermark)
+    const metadata = JSON.stringify({ 
+      name: file.name, 
+      size: file.size, 
+      type: file.type,
+      watermark: '©John_tamvan',
+      timestamp: Date.now()
+    });
     const metaIv = self.crypto.getRandomValues(new Uint8Array(12));
     const metaKey = await importAesKey(subKeys.metaKey);
     const encryptedMeta = await self.crypto.subtle.encrypt(
@@ -249,7 +244,6 @@ export async function encryptFile(
       metaKey,
       new TextEncoder().encode(metadata)
     );
-    const metaLen = new Uint16Array([encryptedMeta.byteLength]);
 
     // Layer 1: AES-256-GCM
     const ivAes = self.crypto.getRandomValues(new Uint8Array(12));
@@ -283,7 +277,7 @@ export async function encryptFile(
     const hashHex = await sha512(new Uint8Array(fileData));
     const hash = new Uint8Array(hashHex.match(/.{1,2}/g)!.map(byte => parseInt(byte, 16)));
 
-    // Header Construction (Partial) (For Version 9 with Argon settings written inside)
+    // Header Construction
     const headerPartialSize = 4 + 1 + 1 + SALT_LENGTH + 2 + 4 + 1 + 12 + 12 + 24 + 12 + 2 + encryptedMeta.byteLength + HASH_SIZE;
     const headerPartial = new Uint8Array(headerPartialSize);
     let hOffset = 0;
@@ -367,7 +361,7 @@ export async function decryptFile(
   password: string,
   settings: Argon2Settings = DEFAULT_ARGON2_SETTINGS,
   onProgress?: (progress: number) => void
-): Promise<{ blob: Blob; fileName: string }> {
+): Promise<{ blob: Blob; fileName: string; watermark?: string }> {
   let fileData: ArrayBuffer | null = null;
   try {
     fileData = await file.arrayBuffer();
@@ -382,7 +376,8 @@ export async function decryptFile(
   const magicStr = new TextDecoder().decode(magic);
 
   if (magicStr === 'JKTC') {
-    return decryptFileTurbo(data, password, onProgress);
+    const result = await decryptFileTurbo(data, password, onProgress);
+    return { ...result, watermark: '©John_tamvan' };
   }
 
   const isThnaFormat = magicStr === 'THNA';
@@ -405,7 +400,7 @@ export async function decryptFile(
       );
       const decrypted = await self.crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, encryptedContent);
       data = null;
-      return { blob: new Blob([decrypted]), fileName: file.name.replace('.enc', '') };
+      return { blob: new Blob([decrypted]), fileName: file.name.replace('.enc', ''), watermark: '©John_tamvan' };
     } catch (e) {
       throw new CryptoError('Decryption failed.', 'DECRYPTION_FAILED');
     }
@@ -415,14 +410,12 @@ export async function decryptFile(
   const algoId = data[5];
   const salt = data.slice(6, 6 + SALT_LENGTH);
 
-  if (onProgress) onProgress(10);
-
   try {
     let decryptedContent: ArrayBuffer | null = null;
     let fileName = file.name.replace('.enc', '');
+    let watermark = '©John_tamvan';
 
-    if (version === 9 && algoId === 6) {
-      // Version 9 Header with inline Argon2 settings
+    if (version >= 9 && algoId === 6) {
       let offset = 6 + SALT_LENGTH;
       const fileIterations = data[offset] | (data[offset + 1] << 8); offset += 2;
       const fileMemorySize = data[offset] | 
@@ -453,214 +446,52 @@ export async function decryptFile(
       if (onProgress) onProgress(30);
 
       const subKeys = await deriveSubKeys(masterKey, salt, version);
-
-      // Clean master key
       masterKey.fill(0);
       masterKey = null;
 
-      // Verify HMAC (Binding Header + Ciphertext)
+      // Verify HMAC
       const hmacKey = await importHmacKey(subKeys.hmacKey);
       let authData: Uint8Array | null = new Uint8Array(headerPartial.byteLength + encryptedContent.byteLength);
       authData.set(headerPartial);
       authData.set(encryptedContent, headerPartial.byteLength);
 
-      const isValidHmac = await self.crypto.subtle.verify(
-        'HMAC',
-        hmacKey,
-        expectedHmac,
-        authData
-      );
-      
+      const isValidHmac = await self.crypto.subtle.verify('HMAC', hmacKey, expectedHmac, authData);
       authData = null;
-      
-      if (!isValidHmac) {
-        throw new CryptoError('Authentication failed (HMAC mismatch).', 'HMAC_FAILED');
-      }
+      if (!isValidHmac) throw new CryptoError('Authentication failed (HMAC mismatch).', 'HMAC_FAILED');
 
       // Decrypt Metadata
-      const metaKey = await importAesKey(subKeys.metaKey);
-      const decryptedMetaBuffer = await self.crypto.subtle.decrypt(
-        { name: 'AES-GCM', iv: metaIv },
-        metaKey,
-        encryptedMeta
-      );
-      const meta = JSON.parse(new TextDecoder().decode(decryptedMetaBuffer));
-      fileName = meta.name;
-
-      // Layer 1: XChaCha20-Poly1305
-      const xChachaCipher = new XChaCha20Poly1305(subKeys.xChachaKey);
-      let decryptedXChacha: Uint8Array | null = xChachaCipher.open(ivXChacha, encryptedContent);
-      if (!decryptedXChacha) throw new CryptoError('XChaCha20 decryption failed.', 'XCHACHA_DECRYPTION_FAILED');
-      if (onProgress) onProgress(60);
-
-      // Layer 2: ChaCha20-Poly1305
-      const chachaCipher = new ChaCha20Poly1305(subKeys.chachaKey);
-      let decryptedChacha: Uint8Array | null = chachaCipher.open(ivChacha, decryptedXChacha);
-      
-      // Free intermediate
-      decryptedXChacha = null;
-      if (!decryptedChacha) throw new CryptoError('ChaCha20 decryption failed.', 'CHACHA_DECRYPTION_FAILED');
-      if (onProgress) onProgress(80);
-
-      // Layer 3: AES-256-GCM
-      const aesKey = await importAesKey(subKeys.aesKey);
-      decryptedContent = await self.crypto.subtle.decrypt(
-        { name: 'AES-GCM', iv: ivAes },
-        aesKey,
-        decryptedChacha
-      );
-
-      // Free intermediate
-      decryptedChacha = null;
-
-      // Verify Integrity
-      const actualHashHex = await sha512(new Uint8Array(decryptedContent));
-      const actualHash = new Uint8Array(actualHashHex.match(/.{1,2}/g)!.map(byte => parseInt(byte, 16)));
-      for (let i = 0; i < HASH_SIZE; i++) {
-        if (actualHash[i] !== expectedHash[i]) {
-          throw new CryptoError('Integrity check failed (SHA-512 mismatch).', 'INTEGRITY_FAILED');
-        }
-      }
-
-      // Zeroize subkeys
-      subKeys.aesKey.fill(0);
-      subKeys.chachaKey.fill(0);
-      subKeys.xChachaKey.fill(0);
-      subKeys.hmacKey.fill(0);
-      subKeys.metaKey.fill(0);
-    } else if ((version === 6 || version === 7 || version === 8) && algoId === 6) {
-      // Hardened Triple Layer V8
-      let offset = 6 + SALT_LENGTH;
-      const ivAes = data.slice(offset, offset + 12); offset += 12;
-      const ivChacha = data.slice(offset, offset + 12); offset += 12;
-      const ivXChacha = data.slice(offset, offset + 24); offset += 24;
-      const metaIv = data.slice(offset, offset + 12); offset += 12;
-      const metaLen = data[offset] | (data[offset + 1] << 8); offset += 2;
-      const encryptedMeta = data.slice(offset, offset + metaLen); offset += metaLen;
-      const expectedHash = data.slice(offset, offset + HASH_SIZE); offset += HASH_SIZE;
-      
-      const headerPartial = data.slice(0, offset);
-      const expectedHmac = data.slice(offset, offset + HMAC_SIZE); offset += HMAC_SIZE;
-      const encryptedContent = data.slice(offset);
-
-      let masterKey: Uint8Array | null = await deriveKeyArgon2(password, salt, settings);
-      if (onProgress) onProgress(30);
-
-      const subKeys = await deriveSubKeys(masterKey, salt, version);
-
-      // Clean master key
-      masterKey.fill(0);
-      masterKey = null;
-
-      // Verify HMAC (Binding Header + Ciphertext)
-      const hmacKey = await importHmacKey(subKeys.hmacKey);
-      let authData: Uint8Array | null = new Uint8Array(headerPartial.byteLength + encryptedContent.byteLength);
-      authData.set(headerPartial);
-      authData.set(encryptedContent, headerPartial.byteLength);
-
-      const isValidHmac = await self.crypto.subtle.verify(
-        'HMAC',
-        hmacKey,
-        expectedHmac,
-        authData
-      );
-      
-      authData = null;
-      
-      if (!isValidHmac) {
-        throw new CryptoError('Authentication failed (HMAC mismatch).', 'HMAC_FAILED');
-      }
-
-      // Decrypt Metadata
-      const metaKey = await importAesKey(subKeys.metaKey);
-      const decryptedMetaBuffer = await self.crypto.subtle.decrypt(
-        { name: 'AES-GCM', iv: metaIv },
-        metaKey,
-        encryptedMeta
-      );
-      const meta = JSON.parse(new TextDecoder().decode(decryptedMetaBuffer));
-      fileName = meta.name;
-
-      // Layer 1: XChaCha20-Poly1305
-      const xChachaCipher = new XChaCha20Poly1305(subKeys.xChachaKey);
-      let decryptedXChacha: Uint8Array | null = xChachaCipher.open(ivXChacha, encryptedContent);
-      if (!decryptedXChacha) throw new CryptoError('XChaCha20 decryption failed.', 'XCHACHA_DECRYPTION_FAILED');
-      if (onProgress) onProgress(60);
-
-      // Layer 2: ChaCha20-Poly1305
-      const chachaCipher = new ChaCha20Poly1305(subKeys.chachaKey);
-      let decryptedChacha: Uint8Array | null = chachaCipher.open(ivChacha, decryptedXChacha);
-      
-      // Free intermediate
-      decryptedXChacha = null;
-      if (!decryptedChacha) throw new CryptoError('ChaCha20 decryption failed.', 'CHACHA_DECRYPTION_FAILED');
-      if (onProgress) onProgress(80);
-
-      // Layer 3: AES-256-GCM
-      const aesKey = await importAesKey(subKeys.aesKey);
-      decryptedContent = await self.crypto.subtle.decrypt(
-        { name: 'AES-GCM', iv: ivAes },
-        aesKey,
-        decryptedChacha
-      );
-
-      // Free intermediate
-      decryptedChacha = null;
-
-      // Verify Integrity
-      const actualHashHex = await sha512(new Uint8Array(decryptedContent));
-      const actualHash = new Uint8Array(actualHashHex.match(/.{1,2}/g)!.map(byte => parseInt(byte, 16)));
-      for (let i = 0; i < HASH_SIZE; i++) {
-        if (actualHash[i] !== expectedHash[i]) {
-          throw new CryptoError('Integrity check failed (SHA-512 mismatch).', 'INTEGRITY_FAILED');
-        }
-      }
-
-      // Zeroize subkeys
-      subKeys.aesKey.fill(0);
-      subKeys.chachaKey.fill(0);
-      subKeys.xChachaKey.fill(0);
-      subKeys.hmacKey.fill(0);
-      subKeys.metaKey.fill(0);
-    } else if (version === 5 && algoId === 5) {
-      // Hardened Triple Layer (V5)
-      let offset = 6 + SALT_LENGTH;
-      const ivAes = data.slice(offset, offset + 12); offset += 12;
-      const ivChacha = data.slice(offset, offset + 12); offset += 12;
-      const ivXChacha = data.slice(offset, offset + 24); offset += 24;
-      const metaIv = data.slice(offset, offset + 12); offset += 12;
-      const metaLen = data[offset] | (data[offset + 1] << 8); offset += 2;
-      const encryptedMeta = data.slice(offset, offset + metaLen); offset += metaLen;
-      const expectedHash = data.slice(offset, offset + HASH_SIZE); offset += HASH_SIZE;
-      const expectedHmac = data.slice(offset, offset + HMAC_SIZE); offset += HMAC_SIZE;
-      const encryptedContent = data.slice(offset);
-
-      let masterKey: Uint8Array | null = await deriveKeyArgon2(password, salt, settings);
-      const subKeys = await deriveSubKeys(masterKey, salt);
-
-      masterKey.fill(0);
-      masterKey = null;
-
-      const hmacKey = await importHmacKey(subKeys.hmacKey);
-      const isValidHmac = await self.crypto.subtle.verify('HMAC', hmacKey, expectedHmac, encryptedContent);
-      if (!isValidHmac) throw new CryptoError('Authentication failed.', 'HMAC_FAILED');
-
       const metaKey = await importAesKey(subKeys.metaKey);
       const decryptedMetaBuffer = await self.crypto.subtle.decrypt({ name: 'AES-GCM', iv: metaIv }, metaKey, encryptedMeta);
       const meta = JSON.parse(new TextDecoder().decode(decryptedMetaBuffer));
       fileName = meta.name;
+      watermark = meta.watermark || watermark;
 
+      // Layer 1: XChaCha20-Poly1305
       const xChachaCipher = new XChaCha20Poly1305(subKeys.xChachaKey);
       let decryptedXChacha: Uint8Array | null = xChachaCipher.open(ivXChacha, encryptedContent);
-      if (!decryptedXChacha) throw new Error();
+      if (!decryptedXChacha) throw new CryptoError('XChaCha20 decryption failed.', 'XCHACHA_DECRYPTION_FAILED');
+      if (onProgress) onProgress(60);
+
+      // Layer 2: ChaCha20-Poly1305
       const chachaCipher = new ChaCha20Poly1305(subKeys.chachaKey);
       let decryptedChacha: Uint8Array | null = chachaCipher.open(ivChacha, decryptedXChacha);
       decryptedXChacha = null;
-      if (!decryptedChacha) throw new Error();
+      if (!decryptedChacha) throw new CryptoError('ChaCha20 decryption failed.', 'CHACHA_DECRYPTION_FAILED');
+      if (onProgress) onProgress(80);
+
+      // Layer 3: AES-256-GCM
       const aesKey = await importAesKey(subKeys.aesKey);
       decryptedContent = await self.crypto.subtle.decrypt({ name: 'AES-GCM', iv: ivAes }, aesKey, decryptedChacha);
       decryptedChacha = null;
 
+      // Verify Integrity
+      const actualHashHex = await sha512(new Uint8Array(decryptedContent));
+      const actualHash = new Uint8Array(actualHashHex.match(/.{1,2}/g)!.map(byte => parseInt(byte, 16)));
+      for (let i = 0; i < HASH_SIZE; i++) {
+        if (actualHash[i] !== expectedHash[i]) throw new CryptoError('Integrity check failed.', 'INTEGRITY_FAILED');
+      }
+
+      // Zeroize subkeys
       subKeys.aesKey.fill(0);
       subKeys.chachaKey.fill(0);
       subKeys.xChachaKey.fill(0);
@@ -670,15 +501,46 @@ export async function decryptFile(
       throw new CryptoError('Unsupported version.', 'UNSUPPORTED_VERSION');
     }
 
-    data = null; // force clear original input pack
-
     if (onProgress) onProgress(100);
-    const resultBlob = new Blob([decryptedContent]), finalFileName = fileName;
-    decryptedContent = null;
-    return { blob: resultBlob, fileName: finalFileName };
+    return { blob: new Blob([decryptedContent]), fileName, watermark };
   } catch (e) {
     if (e instanceof CryptoError) throw e;
     throw new CryptoError('Decryption failed.', 'DECRYPTION_FAILED');
+  }
+}
+
+export async function decryptFileTurbo(
+  data: Uint8Array,
+  password: string,
+  onProgress?: (progress: number) => void
+): Promise<{ blob: Blob; fileName: string }> {
+  try {
+    let offset = 4;
+    const version = data[offset]; offset += 1;
+    const salt = data.slice(offset, offset + SALT_LENGTH); offset += SALT_LENGTH;
+    const ivAes = data.slice(offset, offset + 12); offset += 12;
+    const metaIv = data.slice(offset, offset + 12); offset += 12;
+    const metaLen = new DataView(data.buffer, data.byteOffset + offset, 2).getUint16(0, true); offset += 2;
+    const encryptedMeta = data.slice(offset, offset + metaLen); offset += metaLen;
+    const encryptedContent = data.slice(offset);
+
+    const baseKey = await self.crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
+    const derivedKeyBuffer = await self.crypto.subtle.deriveBits({ name: 'PBKDF2', salt, iterations: 60000, hash: 'SHA-256' }, baseKey, 512);
+    const derivedBytes = new Uint8Array(derivedKeyBuffer);
+    const aesKeyBytes = derivedBytes.slice(0, 32);
+    const metaKeyBytes = derivedBytes.slice(32, 64);
+
+    const aesKey = await self.crypto.subtle.importKey('raw', aesKeyBytes, 'AES-GCM', false, ['decrypt']);
+    const metaKey = await self.crypto.subtle.importKey('raw', metaKeyBytes, 'AES-GCM', false, ['decrypt']);
+
+    const decryptedMetaBuffer = await self.crypto.subtle.decrypt({ name: 'AES-GCM', iv: metaIv }, metaKey, encryptedMeta);
+    const meta = JSON.parse(new TextDecoder().decode(decryptedMetaBuffer));
+    
+    const decryptedContent = await self.crypto.subtle.decrypt({ name: 'AES-GCM', iv: ivAes }, aesKey, encryptedContent);
+    
+    return { blob: new Blob([decryptedContent]), fileName: meta.name };
+  } catch (e) {
+    throw new CryptoError('Turbo decryption failed.', 'DECRYPTION_FAILED');
   }
 }
 
@@ -691,7 +553,7 @@ export function getPasswordStrength(password: string): number {
   if (/[a-z]/.test(password)) strength += 10;
   if (/[0-9]/.test(password)) strength += 20;
   if (/[^A-Za-z0-9]/.test(password)) strength += 20;
-  const commonPatterns = ['123', 'abc', 'password', 'qwerty', 'admin'];
+  const commonPatterns = ['123', 'password', 'qwerty', 'admin'];
   for (const pattern of commonPatterns) {
     if (password.toLowerCase().includes(pattern)) {
       strength -= 20;
@@ -713,191 +575,41 @@ export async function encryptFileTurbo(
     const fileData = await file.arrayBuffer();
     if (onProgress) onProgress(15);
 
-    // Derive base key using ultra-fast native PBKDF2
-    const baseKey = await self.crypto.subtle.importKey(
-      'raw',
-      new TextEncoder().encode(password),
-      'PBKDF2',
-      false,
-      ['deriveBits']
-    );
-    if (onProgress) onProgress(30);
-
-    const derivedKeyBuffer = await self.crypto.subtle.deriveBits(
-      {
-        name: 'PBKDF2',
-        salt,
-        iterations: 60000, // Speed-optimized yet extremely secure Standard
-        hash: 'SHA-256'
-      },
-      baseKey,
-      512 // 64 bytes
-    );
-    if (onProgress) onProgress(60);
-
+    const baseKey = await self.crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
+    const derivedKeyBuffer = await self.crypto.subtle.deriveBits({ name: 'PBKDF2', salt, iterations: 60000, hash: 'SHA-256' }, baseKey, 512);
     const derivedBytes = new Uint8Array(derivedKeyBuffer);
     const aesKeyBytes = derivedBytes.slice(0, 32);
     const metaKeyBytes = derivedBytes.slice(32, 64);
 
-    const aesKey = await self.crypto.subtle.importKey(
-      'raw',
-      aesKeyBytes,
-      'AES-GCM',
-      false,
-      ['encrypt']
-    );
+    const aesKey = await self.crypto.subtle.importKey('raw', aesKeyBytes, 'AES-GCM', false, ['encrypt']);
+    const metaKey = await self.crypto.subtle.importKey('raw', metaKeyBytes, 'AES-GCM', false, ['encrypt']);
 
-    const metaKey = await self.crypto.subtle.importKey(
-      'raw',
-      metaKeyBytes,
-      'AES-GCM',
-      false,
-      ['encrypt']
-    );
-
-    // Metadata preparation
-    const metadata = JSON.stringify({ name: file.name, size: file.size, type: file.type });
+    const metadata = JSON.stringify({ name: file.name, size: file.size, type: file.type, watermark: '©John_tamvan' });
     const metaIv = self.crypto.getRandomValues(new Uint8Array(12));
-    const encryptedMeta = await self.crypto.subtle.encrypt(
-      { name: 'AES-GCM', iv: metaIv },
-      metaKey,
-      new TextEncoder().encode(metadata)
-    );
+    const encryptedMeta = await self.crypto.subtle.encrypt({ name: 'AES-GCM', iv: metaIv }, metaKey, new TextEncoder().encode(metadata));
 
-    // Encrypt file content with hardware-accelerated GCM
     const ivAes = self.crypto.getRandomValues(new Uint8Array(12));
-    const encryptedContent = await self.crypto.subtle.encrypt(
-      { name: 'AES-GCM', iv: ivAes },
-      aesKey,
-      fileData
-    );
-    if (onProgress) onProgress(90);
-
-    const metaLen = new Uint16Array([encryptedMeta.byteLength]);
-    const jktcMagic = new TextEncoder().encode('JKTC');
+    const encryptedContent = await self.crypto.subtle.encrypt({ name: 'AES-GCM', iv: ivAes }, aesKey, fileData);
     
-    // Header block construction
+    const jktcMagic = new TextEncoder().encode('JKTC');
     const headerSize = 4 + 1 + SALT_LENGTH + 12 + 12 + 2 + encryptedMeta.byteLength;
     const header = new Uint8Array(headerSize);
     
     let offset = 0;
     header.set(jktcMagic, offset); offset += 4;
-    header[offset] = 1; offset += 1; // version 1
+    header[offset] = 1; offset += 1;
     header.set(salt, offset); offset += SALT_LENGTH;
     header.set(ivAes, offset); offset += 12;
     header.set(metaIv, offset); offset += 12;
-    header.set(new Uint8Array(metaLen.buffer), offset); offset += 2;
-    header.set(new Uint8Array(encryptedMeta), offset); offset += encryptedMeta.byteLength;
+    new DataView(header.buffer).setUint16(offset, encryptedMeta.byteLength, true); offset += 2;
+    header.set(new Uint8Array(encryptedMeta), offset);
 
-    // Concat everything
     const result = new Uint8Array(header.byteLength + encryptedContent.byteLength);
     result.set(header, 0);
     result.set(new Uint8Array(encryptedContent), header.byteLength);
 
-    // Clear key materials
-    aesKeyBytes.fill(0);
-    metaKeyBytes.fill(0);
-    derivedBytes.fill(0);
-
-    if (onProgress) onProgress(100);
     return new Blob([result], { type: 'application/octet-stream' });
-  } catch (error) {
-    throw new CryptoError('Hardware AES-GCM Encryption failed.', 'ENCRYPTION_FAILED');
-  }
-}
-
-export async function decryptFileTurbo(
-  data: Uint8Array,
-  password: string,
-  onProgress?: (progress: number) => void
-): Promise<{ blob: Blob; fileName: string }> {
-  try {
-    if (onProgress) onProgress(10);
-    
-    // Header parsing
-    let offset = 4; // Skip 'JKTC' magic
-    const version = data[offset]; offset += 1;
-    if (version !== 1) {
-      throw new CryptoError('Unsupported JKTC version.', 'UNSUPPORTED_VERSION');
-    }
-
-    const salt = data.slice(offset, offset + SALT_LENGTH); offset += SALT_LENGTH;
-    const ivAes = data.slice(offset, offset + 12); offset += 12;
-    const metaIv = data.slice(offset, offset + 12); offset += 12;
-    
-    const metaLen = data[offset] | (data[offset + 1] << 8); offset += 2;
-    const encryptedMeta = data.slice(offset, offset + metaLen); offset += metaLen;
-    const encryptedContent = data.slice(offset);
-
-    if (onProgress) onProgress(20);
-
-    // Derive keys
-    const baseKey = await self.crypto.subtle.importKey(
-      'raw',
-      new TextEncoder().encode(password),
-      'PBKDF2',
-      false,
-      ['deriveBits']
-    );
-
-    const derivedKeyBuffer = await self.crypto.subtle.deriveBits(
-      {
-        name: 'PBKDF2',
-        salt,
-        iterations: 60000,
-        hash: 'SHA-256'
-      },
-      baseKey,
-      512
-    );
-    if (onProgress) onProgress(50);
-
-    const derivedBytes = new Uint8Array(derivedKeyBuffer);
-    const aesKeyBytes = derivedBytes.slice(0, 32);
-    const metaKeyBytes = derivedBytes.slice(32, 64);
-
-    const aesKey = await self.crypto.subtle.importKey(
-      'raw',
-      aesKeyBytes,
-      'AES-GCM',
-      false,
-      ['decrypt']
-    );
-
-    const metaKey = await self.crypto.subtle.importKey(
-      'raw',
-      metaKeyBytes,
-      'AES-GCM',
-      false,
-      ['decrypt']
-    );
-
-    if (onProgress) onProgress(70);
-
-    // Decrypt Metadata
-    const decryptedMetaBuffer = await self.crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv: metaIv },
-      metaKey,
-      encryptedMeta
-    );
-    const meta = JSON.parse(new TextDecoder().decode(decryptedMetaBuffer));
-    const fileName = meta.name;
-
-    // Decrypt Core File Content with native GCM acceleration
-    const decryptedContent = await self.crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv: ivAes },
-      aesKey,
-      encryptedContent
-    );
-
-    // Zeroize keys
-    aesKeyBytes.fill(0);
-    metaKeyBytes.fill(0);
-    derivedBytes.fill(0);
-
-    if (onProgress) onProgress(100);
-    return { blob: new Blob([decryptedContent]), fileName };
-  } catch (error) {
-    throw new CryptoError('Hardware AES-GCM Decryption failed. Incorrect password or modified ciphertext.', 'DECRYPTION_FAILED');
+  } catch (e) {
+    throw new CryptoError('Turbo encryption failed.', 'ENCRYPTION_FAILED');
   }
 }
