@@ -1,0 +1,5 @@
+{
+  "name": "JohnCrypt - Secure File Encryption",
+  "description": "A high-performance file encryption and decryption tool with a liquid glass aesthetic. Securely process files using AES-256-GCM or ChaCha20-Poly1305 directly in your browser. Fully private and decentralized.",
+  "requestFramePermissions": []
+}

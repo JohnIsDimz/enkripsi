@@ -1,0 +1,170 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+}
+
+:root {
+  --bg-main: #020617;
+  --text-main: #ffffff;
+  --text-muted: rgba(255, 255, 255, 0.6);
+  --card-bg: rgba(255, 255, 255, 0.03);
+  --border-color: rgba(255, 255, 255, 0.1);
+  --glass-highlight: rgba(255, 255, 255, 0.15);
+  --accent-blue: #0ea5e9;
+  --gradient-1: #0ea5e944;
+  --gradient-2: #3b82f633;
+  --gradient-3: #06b6d422;
+}
+
+:root.light {
+  --bg-main: #e0f2fe;
+  --text-main: #0f172a;
+  --text-muted: rgba(15, 23, 42, 0.7);
+  --card-bg: rgba(255, 255, 255, 0.4);
+  --border-color: rgba(255, 255, 255, 0.6);
+  --glass-highlight: rgba(255, 255, 255, 0.8);
+  --accent-blue: #0284c7;
+  --gradient-1: #38bdf855;
+  --gradient-2: #60a5fa44;
+  --gradient-3: #22d3ee33;
+}
+
+@layer base {
+  body {
+    @apply antialiased overflow-x-hidden transition-colors duration-500;
+    background-color: var(--bg-main);
+    color: var(--text-main);
+    background-image: 
+      radial-gradient(circle at 15% 50%, var(--gradient-1) 0%, transparent 50%),
+      radial-gradient(circle at 85% 30%, var(--gradient-2) 0%, transparent 50%),
+      radial-gradient(circle at 50% 80%, var(--gradient-3) 0%, transparent 50%);
+    background-attachment: fixed;
+  }
+}
+
+@layer components {
+  .glass-card {
+    @apply backdrop-blur-lg rounded-3xl transition-all duration-300;
+    background: linear-gradient(135deg, var(--card-bg) 0%, rgba(255,255,255,0.01) 100%);
+    border: 1px solid var(--border-color);
+    box-shadow: 
+      0 4px 20px -2px rgba(0, 0, 0, 0.15),
+      inset 0 1px 1px 0 var(--glass-highlight),
+      inset 0 -1px 1px 0 rgba(0,0,0,0.05);
+  }
+  
+  .glass-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 
+      0 8px 30px -4px rgba(0, 0, 0, 0.2),
+      inset 0 1px 1px 0 var(--glass-highlight),
+      inset 0 -1px 1px 0 rgba(0,0,0,0.05);
+  }
+
+  .glass-button {
+    @apply relative overflow-hidden backdrop-blur-md transition-all duration-300;
+    background: linear-gradient(135deg, rgba(255,255,255,0.1) 0%, rgba(255,255,255,0) 100%);
+    border: 1px solid var(--border-color);
+    box-shadow: 
+      0 2px 10px 0 rgba(0, 0, 0, 0.05),
+      inset 0 1px 1px 0 var(--glass-highlight);
+  }
+
+  .glass-button:hover {
+    transform: translateY(-1px);
+    background: linear-gradient(135deg, rgba(255,255,255,0.15) 0%, rgba(255,255,255,0.02) 100%);
+    box-shadow: 
+      0 4px 15px 0 rgba(0, 0, 0, 0.1),
+      inset 0 1px 1px 0 var(--glass-highlight);
+  }
+
+  .glass-button:active {
+    transform: translateY(1px);
+  }
+
+  .water-drop {
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--gradient-1), var(--gradient-2));
+    box-shadow: inset 10px 10px 20px rgba(255,255,255,0.1), inset -10px -10px 20px rgba(0,0,0,0.05);
+    border: 1px solid var(--glass-highlight);
+  }
+
+  /* Keyframes removed to prevent heavy GPU frame repaint loops */
+
+  .liquid-progress {
+    position: relative;
+    overflow: hidden;
+    background: rgba(255, 255, 255, 0.05);
+    border-radius: 999px;
+    box-shadow: inset 0 1px 3px rgba(0,0,0,0.2);
+  }
+
+  .liquid-fill {
+    height: 100%;
+    background: linear-gradient(90deg, #0ea5e9, #3b82f6, #06b6d4);
+    background-size: 200% 100%;
+    animation: liquid-flow 2s linear infinite;
+    box-shadow: inset 0 2px 5px rgba(255,255,255,0.3);
+  }
+
+  @keyframes liquid-flow {
+    0% { background-position: 0% 50%; }
+    100% { background-position: 200% 50%; }
+  }
+
+  .neon-glow {
+    box-shadow: 0 0 20px rgba(59, 130, 246, 0.3);
+    transition: all 0.3s ease;
+  }
+
+  .neon-glow:hover {
+    box-shadow: 0 0 30px rgba(59, 130, 246, 0.6);
+    transform: translateY(-2px);
+  }
+
+  .floating {
+    /* Static background blurred elements are 100% lighter than infinite translateY translations */
+    transform: translateY(0);
+  }
+
+  .custom-scrollbar::-webkit-scrollbar {
+    width: 6px;
+  }
+
+  .custom-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .custom-scrollbar::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 10px;
+  }
+
+  .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.2);
+  }
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 10px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+/* Hide Vite HMR Error Overlay (WebSocket closed without opened) */
+vite-error-overlay {
+  display: none !important;
+}
