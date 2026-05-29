@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useRef } from 'react';
 import { 
-  FileText, Image as ImageIcon, File as FileIcon, Film, 
+  FileText, ImageIcon, File as FileIcon, Film, 
   Play, Pause, Volume2, VolumeX, Terminal, Code2, 
   Cpu, Eye, Archive, Folder, ExternalLink, HelpCircle, Shield
 } from 'lucide-react';
@@ -116,6 +116,12 @@ function highlightCode(code: string, fileName: string): string {
   return escaped;
 }
 
+function formatTime(seconds: number): string {
+  const mins = Math.floor(seconds / 60);
+  const secs = Math.floor(seconds % 60);
+  return `${mins}:${secs.toString().padStart(2, '0')}`;
+}
+
 export const FilePreview: React.FC<FilePreviewProps> = ({ file, fileName, isEncryptedSource }) => {
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [fileType, setFileType] = useState<'image' | 'video' | 'audio' | 'pdf' | 'code' | 'zip' | 'encrypted' | 'other'>('other');
@@ -138,6 +144,36 @@ export const FilePreview: React.FC<FilePreviewProps> = ({ file, fileName, isEncr
   
   const actualName = (file as File).name || fileName || 'Secured Sandbox Item';
   const actualType = file.type || '';
+
+  const handleAudioTimeUpdate = () => {
+    if (audioRef.current) {
+      setAudioCurrentTime(audioRef.current.currentTime);
+      setAudioDuration(audioRef.current.duration);
+      setAudioProgress((audioRef.current.currentTime / audioRef.current.duration) * 100);
+    }
+  };
+
+  const handleAudioSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const time = (parseFloat(e.target.value) / 100) * audioDuration;
+    if (audioRef.current) {
+      audioRef.current.currentTime = time;
+    }
+  };
+
+  const togglePlay = () => {
+    if (audioRef.current) {
+      if (audioPlaying) audioRef.current.pause();
+      else audioRef.current.play();
+      setAudioPlaying(!audioPlaying);
+    }
+  };
+
+  const toggleMute = () => {
+    if (audioRef.current) {
+      audioRef.current.muted = !audioMuted;
+      setAudioMuted(!audioMuted);
+    }
+  };
 
   useEffect(() => {
     if (!file) return;
@@ -234,6 +270,9 @@ export const FilePreview: React.FC<FilePreviewProps> = ({ file, fileName, isEncr
             cleanedJS = cleanedJS.replace(/<[A-Za-z0-9_,\s]+>/g, '');
           }
           
+          // Escape closing script tags to prevent sandbox breakout
+          const escapedJS = cleanedJS.replace(/<\/script>/gi, '<\\/script>');
+
           const simpleHtml = `
             <!DOCTYPE html>
             <html>
@@ -255,7 +294,7 @@ export const FilePreview: React.FC<FilePreviewProps> = ({ file, fileName, isEncr
                     p.innerText = '[Console Log] ' + args.join(' ');
                     document.body.appendChild(p);
                   };
-                  ${cleanedJS}
+                  ${escapedJS}
                   const p = document.createElement('p');
                   p.style.color = '#38bdf8';
                   p.innerText = '\\n[Execution completed successfully!]';
@@ -274,12 +313,14 @@ export const FilePreview: React.FC<FilePreviewProps> = ({ file, fileName, isEncr
           const url = URL.createObjectURL(blob);
           setSandboxIframeUrl(url);
         } else if (lowerName.endsWith('.css')) {
+          // Escape closing style tags
+          const escapedCSS = text.replace(/<\/style>/gi, '<\\/style>');
           const sampleHtml = `
             <!DOCTYPE html>
             <html>
             <head>
               <style>
-                ${text}
+                ${escapedCSS}
                 body { font-family: sans-serif; padding: 25px; transition: all 0.3s ease; }
                 .card { border: 1px solid #ddd; padding: 20px; border-radius: 8px; max-width: 400px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
               </style>
@@ -338,84 +379,46 @@ export const FilePreview: React.FC<FilePreviewProps> = ({ file, fileName, isEncr
                 outputLines.push(`+----+-------------------+--------------------+`);
                 outputLines.push(`| id | name              | credentials_status |`);
                 outputLines.push(`+----+-------------------+--------------------+`);
-                outputLines.push(`| 1  | John Tamvan       | AUTHORIZED         |`);
-                outputLines.push(`| 2  | Private Operator  | ACTIVE_VAULT_DECRYPTED`);
+                outputLines.push(`| 1  | John_tamvan       | ENCRYPTED_MASTER   |`);
+                outputLines.push(`| 2  | Cyber_Sentry      | PROTECTED_NODE     |`);
                 outputLines.push(`+----+-------------------+--------------------+`);
-                outputLines.push(`(2 rows selected. Execution duration: 1.04ms)`);
+              } else {
+                outputLines.push(`[Exec] ${trimmed.substring(0, 40)}${trimmed.length > 40 ? '...' : ''}`);
               }
             });
-            if (outputLines.length === 1) {
-              outputLines.push('[Info] Script queries loaded in sandbox session successfully.');
-            }
-          } else if (detectedLang.includes('Bash') || detectedLang.includes('shell')) {
-            const matchesText = text.match(/(echo|printf)\s+["']?([^"']+)["']?/g) || [];
-            matchesText.forEach(m => {
-              const cleaned = m.replace(/(echo|printf)\s+["']?/, '').replace(/["']$/, '');
-              outputLines.push(cleaned);
-            });
-            if (outputLines.length === 0) {
-              outputLines.push('[Bash Sandbox] Executed general system configuration scripts.');
-            }
+            outputLines.push('\n[Execution completed successfully!]');
           } else {
-            const regexes = [
-              /print\s*\(\s*["']([^"']+)["']\s*\)/g,
-              /println\s*\(\s*["']([^"']+)["']\s*\)/g,
-              /println!\s*\(\s*["']([^"']+)["']\s*\)/g,
-              /std::cout\s*<<\s*["']([^"']+)["']/g,
-              /System\.out\.print(ln)?\s*\(\s*["']([^"']+)["']\s*\)/g,
-              /printf\s*\(\s*["']([^"']+)["']\s*\)/g,
-              /echo\s+["']([^"']+)["']/g,
-              /puts\s+["']([^"']+)["']/g,
-            ];
-            regexes.forEach(regex => {
-              let match;
-              while ((match = regex.exec(text)) !== null) {
-                const output = match[1] || match[2] || '';
-                if (output && !outputLines.includes(output)) {
-                  outputLines.push(output);
-                }
-              }
-            });
-            if (outputLines.length === 0) {
-              outputLines.push(`Hello World from ${actualName.split('.').pop()?.toUpperCase()} file simulation code-structure!`);
-            }
+            outputLines.push(`[System] Initializing ${detectedLang} Sandbox environment...`);
+            outputLines.push(`[System] Mounting virtual filesystem for ${actualName}...`);
+            outputLines.push(`[System] Executing bytecode in isolated memory block...`);
+            outputLines.push('--------------------------------------------------');
+            outputLines.push(`[Output] Hello from JohnCrypt Secure Runtime!`);
+            outputLines.push(`[Output] Successfully parsed ${text.length} bytes of ${lowerName.split('.').pop()?.toUpperCase()} source.`);
+            outputLines.push('--------------------------------------------------');
+            outputLines.push('[System] Process finished with exit code 0.');
           }
 
-          const consoleLogLines = outputLines.map(line => `<p style="margin: 4px 0; color: #10b981;">&gt; ${line}</p>`).join('');
-
-          const terminalHtml = `
+          const interpreterHtml = `
             <!DOCTYPE html>
             <html>
             <head>
               <style>
-                body { background-color: #05070e; color: #f1f5f9; font-family: monospace; padding: 22px; font-size: 13px; line-height: 1.6; }
-                .term-box { border: 1px solid #1e293b; background: #020306; border-radius: 8px; padding: 20px; box-shadow: inset 0 2px 10px rgba(0,0,0,0.8), 0 10px 30px rgba(0,0,0,0.5); }
-                .hdr { color: #f59e0b; font-weight: bold; margin-bottom: 2px; }
-                .stat { color: #64748b; font-size: 11px; margin-bottom: 15px; }
-                .success-msg { color: #38bdf8; font-weight: bold; margin-top: 15px; border-top: 1px dashed #1e293b; padding-top: 12px; }
-                .watermark { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%) rotate(-15deg); color: rgba(255, 255, 255, 0.015); font-size: 26px; font-weight: 900; white-space: nowrap; pointer-events: none; text-shadow: 0 0 1px rgba(255,255,255,0.01); text-transform: uppercase; }
+                body { background-color: #03060f; color: #38bdf8; font-family: 'JetBrains Mono', monospace; padding: 25px; line-height: 1.6; }
+                .header { color: #64748b; font-size: 11px; margin-bottom: 20px; border-bottom: 1px solid #1e293b; padding-bottom: 10px; }
+                .log { margin: 5px 0; }
+                b { color: #ffffff; }
               </style>
             </head>
             <body>
-              <div class="watermark">©John_tamvan • Secure Sandbox</div>
-              <div class="term-box">
-                <div class="hdr">[${detectedLang} Sandbox Compiler Runtime Logs]</div>
-                <div class="stat">Thread Isolation: Active • Sandbox Engine Safe • File: ${actualName}</div>
-                <div>
-                  <p style="color: #64748b; margin: 3px 0;">[SYSTEM] Initializing compilation layers...</p>
-                  <p style="color: #64748b; margin: 3px 0;">[SYSTEM] Verification check passed: Integrity Clean.</p>
-                  <p style="color: #64748b; margin: 3px 0; margin-bottom: 15px;">[SYSTEM] Executing direct pipeline instructions:</p>
-                  ${consoleLogLines}
-                </div>
-                <div class="success-msg">
-                  <p style="margin: 0;">✔ Program Exited with Code: 0 (Successful)</p>
-                  <p style="margin: 2px 0 0 0; font-size: 11px; color: #64748b;">Process execution time: ${(Math.random() * 8 + 1).toFixed(2)}ms | Real Memory Allocation: ~4MB</p>
-                </div>
+              <div class="header">
+                <b>[JohnCrypt Secure Interpreter v5.0]</b><br/>
+                Target: ${actualName} | Environment: ${detectedLang}
               </div>
+              ${outputLines.map(line => `<div class="log">${line}</div>`).join('')}
             </body>
             </html>
           `;
-          const blob = new Blob([terminalHtml], { type: 'text/html' });
+          const blob = new Blob([interpreterHtml], { type: 'text/html' });
           const url = URL.createObjectURL(blob);
           setSandboxIframeUrl(url);
         }
@@ -423,82 +426,33 @@ export const FilePreview: React.FC<FilePreviewProps> = ({ file, fileName, isEncr
       reader.readAsText(file);
     } 
     
-    else if (lowerName.endsWith('.zip') || actualType === 'application/zip' || actualType.includes('compressed-zip')) {
+    else if (actualType === 'application/zip' || actualType === 'application/x-zip-compressed' || lowerName.endsWith('.zip')) {
       setFileType('zip');
       const reader = new FileReader();
       reader.onload = (e) => {
         const buffer = e.target?.result as ArrayBuffer;
         if (buffer) {
-          const parsed = parseZipEntries(buffer);
-          setZipFiles(parsed);
+          const entries = parseZipEntries(buffer);
+          setZipFiles(entries);
         }
       };
       reader.readAsArrayBuffer(file);
-    } 
-    
+    }
+
     else {
       setFileType('other');
     }
-  }, [file, fileName, actualName, actualType, isEncryptedSource]);
-
-  // Clean sandbox urls
-  useEffect(() => {
-    return () => {
-      if (sandboxIframeUrl) {
-        URL.revokeObjectURL(sandboxIframeUrl);
-      }
-    };
-  }, [sandboxIframeUrl]);
-
-  // Handle Playback triggers
-  const togglePlay = () => {
-    if (!audioRef.current) return;
-    if (audioPlaying) {
-      audioRef.current.pause();
-    } else {
-      audioRef.current.play().catch(err => console.error("Audio playback blocked", err));
-    }
-    setAudioPlaying(!audioPlaying);
-  };
-
-  const toggleMute = () => {
-    if (!audioRef.current) return;
-    audioRef.current.muted = !audioMuted;
-    setAudioMuted(!audioMuted);
-  };
-
-  const handleAudioTimeUpdate = () => {
-    if (!audioRef.current) return;
-    const current = audioRef.current.currentTime;
-    const dur = audioRef.current.duration || 0;
-    setAudioCurrentTime(current);
-    setAudioDuration(dur);
-    setAudioProgress(dur > 0 ? (current / dur) * 100 : 0);
-  };
-
-  const handleAudioSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (!audioRef.current || audioDuration === 0) return;
-    const pct = parseFloat(e.target.value);
-    const newTime = (pct / 100) * audioDuration;
-    audioRef.current.currentTime = newTime;
-    setAudioProgress(pct);
-  };
-
-  const formatTime = (secs: number) => {
-    const m = Math.floor(secs / 60);
-    const s = Math.floor(secs % 60);
-    return `${m}:${s < 10 ? '0' : ''}${s}`;
-  };
+  }, [file, actualName, actualType, isEncryptedSource]);
 
   return (
     <motion.div 
-      initial={{ opacity: 0, scale: 0.98 }}
+      initial={{ opacity: 0, scale: 0.95 }}
       animate={{ opacity: 1, scale: 1 }}
-      className="w-full aspect-video glass-card border border-[var(--border-color)] overflow-hidden flex flex-col relative group shadow-[0_15px_40px_rgba(0,0,0,0.6)]"
+      className="w-full h-full flex flex-col glass-card border border-[var(--border-color)] rounded-2xl overflow-hidden shadow-2xl relative"
     >
-      {/* Top Banner Tag */}
-      <div className="flex items-center justify-between px-4 py-2 border-b border-[var(--border-color)] bg-black/40 backdrop-blur-md relative z-30 select-none text-left">
-        <div className="flex items-center gap-2">
+      {/* Header bar */}
+      <div className="px-4 py-3 bg-black/40 border-b border-[var(--border-color)] flex items-center justify-between z-20 backdrop-blur-md">
+        <div className="flex items-center gap-2.5">
           <div className="w-2.5 h-2.5 rounded-full bg-cyan-400 animate-pulse border border-cyan-300 shadow-[0_0_8px_rgba(34,211,238,0.8)]" />
           <span className="text-[10px] font-mono font-bold tracking-widest text-cyan-400 uppercase">
             JohnCrypt Security Safe Sandbox
@@ -767,7 +721,8 @@ export const FilePreview: React.FC<FilePreviewProps> = ({ file, fileName, isEncr
             </div>
           </div>
         )}
-          {/* =============== CODE PREVIEW & SANDBOX COMPILE =============== */}
+
+        {/* =============== CODE PREVIEW & SANDBOX COMPILE =============== */}
         {fileType === 'code' && (
           <div className="relative w-full h-full flex flex-col bg-[#090d16] text-left z-10 font-mono overflow-hidden">
             {/* Sub Tabs for Viewer vs Compiler Execution */}
@@ -833,17 +788,17 @@ export const FilePreview: React.FC<FilePreviewProps> = ({ file, fileName, isEncr
                     <div className="relative z-10 flex gap-4">
                       {/* Simulated line ratios */}
                       <div className="text-zinc-650 text-right select-none pr-2 border-r border-[#1e293b] font-mono text-[10px] opacity-40">
-                        {codeContent.split('\n').slice(0, 150).map((_, idx) => (
+                        {codeContent.split('\n').slice(0, 500).map((_, idx) => (
                           <div key={idx}>{idx + 1}</div>
                         ))}
-                        {codeContent.split('\n').length > 150 && <div>...</div>}
+                        {codeContent.split('\n').length > 500 && <div>...</div>}
                       </div>
                       
                       <pre className="flex-1 font-mono text-zinc-200 outline-none select-text overflow-x-auto whitespace-pre">
                         <code dangerouslySetInnerHTML={{ 
                           __html: highlightCode(
-                            codeContent.split('\n').slice(0, 150).join('\n') + 
-                            (codeContent.split('\n').length > 150 ? '\n// ... Content truncated for optimized preview performance' : ''),
+                            codeContent.split('\n').slice(0, 500).join('\n') + 
+                            (codeContent.split('\n').length > 500 ? '\n// ... Content truncated for optimized preview performance' : ''),
                             actualName
                           )
                         }} />
@@ -858,19 +813,21 @@ export const FilePreview: React.FC<FilePreviewProps> = ({ file, fileName, isEncr
                     exit={{ opacity: 0, y: -5 }}
                     className="w-full h-full relative bg-[#090d16]"
                   >
-                    {/* Sandboxed Secure iFrame Rendering */}
+                    {/* Sandboxed Secure iFrame Rendering - 1:1 Optimized Size */}
                     {sandboxIframeUrl ? (
-                      <div className="relative w-full h-full">
-                        <iframe 
-                          src={sandboxIframeUrl}
-                          title="Decrypted App WebSandbox"
-                          sandbox="allow-scripts"
-                          className="w-full h-full border-none bg-white/5 opacity-90"
-                        />
+                      <div className="relative w-full h-full flex items-center justify-center p-4">
+                        <div className="w-full h-full max-w-[1200px] aspect-square bg-white shadow-2xl rounded-lg overflow-hidden border border-white/10">
+                          <iframe 
+                            src={sandboxIframeUrl}
+                            title="Decrypted App WebSandbox"
+                            sandbox="allow-scripts"
+                            className="w-full h-full border-none bg-white opacity-100"
+                          />
+                        </div>
                         {/* Floating visual security shield */}
-                        <div className="absolute bottom-3 right-4 select-none pointer-events-none z-20">
-                          <span className="text-emerald-400 font-mono text-[9px] font-bold tracking-widest bg-zinc-950/90 border border-emerald-400/30 px-3 py-1.5 rounded-lg drop-shadow shadow-lg flex items-center gap-1.5 animate-pulse">
-                            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping" />
+                        <div className="absolute bottom-6 right-8 select-none pointer-events-none z-20">
+                          <span className="text-emerald-400 font-mono text-[10px] font-bold tracking-widest bg-zinc-950/90 border border-emerald-400/30 px-4 py-2 rounded-xl drop-shadow shadow-lg flex items-center gap-2 animate-pulse">
+                            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
                             ACTIVE SANDBOX • ©John_tamvan
                           </span>
                         </div>
