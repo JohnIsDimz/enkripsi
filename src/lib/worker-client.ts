@@ -97,7 +97,7 @@ class CryptoWorkerClient {
     return this.sendRequest('ENCRYPT_SYMMETRIC', { file, password, settings }, onProgress);
   }
 
-  async decryptSymmetric(file: File, password: string, settings: any, onProgress?: (p: number) => void): Promise<{ blob: Blob; fileName: string }> {
+  async decryptSymmetric(file: File, password: string, settings: any, onProgress?: (p: number) => void): Promise<{ blob: Blob; fileName: string; watermark?: string }> {
     return this.sendRequest('DECRYPT_SYMMETRIC', { file, password, settings }, onProgress);
   }
 
@@ -113,7 +113,7 @@ class CryptoWorkerClient {
     return this.sendRequest('ENCRYPT_HYBRID', { file, publicKeyJwk, signingKeyJwk }, onProgress);
   }
 
-  async decryptHybrid(file: File, privateKeyJwk: string, verifyKeyJwk?: string, onProgress?: (p: number) => void): Promise<{ decryptedData: ArrayBuffer; fileName: string }> {
+  async decryptHybrid(file: File, privateKeyJwk: string, verifyKeyJwk?: string, onProgress?: (p: number) => void): Promise<{ decryptedData: ArrayBuffer; fileName: string; watermark?: string }> {
     return this.sendRequest('DECRYPT_HYBRID', { file, privateKeyJwk, verifyKeyJwk }, onProgress);
   }
 }
