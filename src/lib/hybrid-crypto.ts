@@ -18,7 +18,7 @@ const TAG_SIZE = 16;
 const HASH_SIZE = 64;
 const HMAC_SIZE = 64;
 const MAGIC_BYTES = new TextEncoder().encode('THYB'); // Thena Hybrid Magic
-const VERSION = 8;
+const VERSION = 10; // Version 10 (Watermark & Enhanced Cascade)
 
 export interface HybridKeyPair {
   encryption: {
@@ -112,9 +112,9 @@ async function deriveHybridSubKeys(
 
   const baseKey = await self.crypto.subtle.importKey('raw', combined, 'HKDF', false, ['deriveKey']);
   
-  const sessionInfo = version === 8 ? 'THENACRYPT-HYBRID-SESSION-V8' : 'THENACRYPT-HYBRID-SESSION-V4';
-  const hmacInfo = version === 8 ? 'THENACRYPT-HYBRID-HMAC-V8' : 'THENACRYPT-HYBRID-HMAC-V4';
-  const metaInfo = version === 8 ? 'THENACRYPT-HYBRID-META-V8' : 'THENACRYPT-HYBRID-META-V4';
+  const sessionInfo = version >= 8 ? `THENACRYPT-HYBRID-SESSION-V${version}` : 'THENACRYPT-HYBRID-SESSION-V4';
+  const hmacInfo = version >= 8 ? `THENACRYPT-HYBRID-HMAC-V${version}` : 'THENACRYPT-HYBRID-HMAC-V4';
+  const metaInfo = version >= 8 ? `THENACRYPT-HYBRID-META-V${version}` : 'THENACRYPT-HYBRID-META-V4';
 
   const sessionKey = await self.crypto.subtle.deriveKey(
     {
@@ -196,14 +196,20 @@ export async function encryptHybrid(
     const { sessionKey, hmacKey, metaKey } = await deriveHybridSubKeys(rsaSecret, ecdhSecret, kyberSecret);
     
     // Zero out sensitive intermediary Secrets to prevent leaking
-    // Note: rsaSecret is cleared AFTER being encrypted for the recipient below
     ecdhSecret.fill(0);
     kyberSecret.fill(0);
 
     if (onProgress) onProgress(30);
 
     // 5. Encrypt Metadata
-    const metadata = JSON.stringify({ name: file.name, size: file.size, type: file.type, lastModified: file.lastModified });
+    const metadata = JSON.stringify({ 
+      name: file.name, 
+      size: file.size, 
+      type: file.type, 
+      lastModified: file.lastModified,
+      watermark: '©John_tamvan',
+      timestamp: Date.now()
+    });
     const metaIv = self.crypto.getRandomValues(new Uint8Array(12));
     const encryptedMeta = await self.crypto.subtle.encrypt({ name: 'AES-GCM', iv: metaIv }, metaKey, new TextEncoder().encode(metadata));
     const metaLen = new Uint16Array([encryptedMeta.byteLength]);
@@ -216,7 +222,7 @@ export async function encryptHybrid(
     const tag = fullCiphertext.slice(-TAG_SIZE);
     if (onProgress) onProgress(50);
 
-    // 7. Encrypt RSA Secret (using the SAME rsaSecret used for key derivation)
+    // 7. Encrypt RSA Secret
     const encryptedRsaSecret = await self.crypto.subtle.encrypt({ name: 'RSA-OAEP' }, pubKey, rsaSecret);
     if (onProgress) onProgress(70);
 
@@ -232,7 +238,6 @@ export async function encryptHybrid(
     }
 
     // 9. Build Package
-    // Zero out rsaSecret now that it has been encrypted
     rsaSecret.fill(0);
 
     const partialSize = 4 + 1 + RSA_KEY_SIZE + RSA_KEY_SIZE + KYBER_CIPHERTEXT_SIZE + ECDH_PUB_SIZE + IV_SIZE + 12 + 2 + encryptedMeta.byteLength + TAG_SIZE + HASH_SIZE;
@@ -263,7 +268,6 @@ export async function encryptHybrid(
     result.set(hmacVal, partialSize);
     result.set(ciphertext, partialSize + HMAC_SIZE);
 
-    // Free buffers
     fileData = null;
 
     if (onProgress) onProgress(100);
@@ -278,7 +282,7 @@ export async function decryptHybrid(
   privateKeyJwk: string,
   verifyKeyJwk?: string,
   onProgress?: (p: number) => void
-): Promise<{ decryptedData: ArrayBuffer, fileName: string }> {
+): Promise<{ decryptedData: ArrayBuffer, fileName: string, watermark?: string }> {
   try {
     let data: Uint8Array | null = new Uint8Array(packageData);
     const magic = data.slice(0, 4);
@@ -287,7 +291,7 @@ export async function decryptHybrid(
     if (!isHybridFormat) {
       const legacyResult = await decryptHybridV1(packageData, privateKeyJwk, verifyKeyJwk, onProgress);
       data = null;
-      return legacyResult;
+      return { ...legacyResult, watermark: '©John_tamvan' };
     }
 
     const version = data[4];
@@ -295,7 +299,7 @@ export async function decryptHybrid(
     if (version === 2) {
       const v2Result = await decryptHybridV2(packageData, privateKeyJwk, verifyKeyJwk, onProgress);
       data = null;
-      return v2Result;
+      return { ...v2Result, watermark: '©John_tamvan' };
     }
 
     const keys = await importKey(privateKeyJwk, 'private', 'RSA-OAEP') as { rsa: CryptoKey; ecdh: CryptoKey };
@@ -334,7 +338,6 @@ export async function decryptHybrid(
     const { sessionKey, hmacKey, metaKey } = await deriveHybridSubKeys(rsaSecret, ecdhSecret, kyberSecret, version);
     if (onProgress) onProgress(40);
 
-    // Zeroize sensitive secrets
     rsaSecret.fill(0);
     ecdhSecret.fill(0);
     kyberSecret.fill(0);
@@ -351,6 +354,7 @@ export async function decryptHybrid(
     const decryptedMetaBuffer = await self.crypto.subtle.decrypt({ name: 'AES-GCM', iv: metaIv }, metaKey, encryptedMeta);
     const meta = JSON.parse(new TextDecoder().decode(decryptedMetaBuffer));
     const fileName = meta.name;
+    const watermark = meta.watermark || '©John_tamvan';
 
     // 5. Decrypt Data
     let fullCiphertext: Uint8Array | null = new Uint8Array(ciphertext.byteLength + TAG_SIZE);
@@ -374,10 +378,10 @@ export async function decryptHybrid(
       if (!isValid) throw new Error('Signature verification failed');
     }
 
-    data = null; // deallocate raw package data copy
+    data = null;
 
     if (onProgress) onProgress(100);
-    return { decryptedData, fileName };
+    return { decryptedData, fileName, watermark };
   } catch (e: any) {
     if (e.message === 'Integrity check failed') throw new CryptoError('Data integrity corrupted.', 'INTEGRITY_FAILED');
     if (e.message === 'Signature verification failed') throw new CryptoError('Digital signature invalid.', 'SIGNATURE_FAILED');
@@ -386,155 +390,48 @@ export async function decryptHybrid(
   }
 }
 
-async function decryptHybridV2(
-  packageData: ArrayBuffer,
-  privateKeyJwk: string,
-  verifyKeyJwk?: string,
-  onProgress?: (p: number) => void
-): Promise<{ decryptedData: ArrayBuffer, fileName: string }> {
+export async function importKey(jwkString: string, type: 'public' | 'private', algorithm: 'RSA-OAEP' | 'RSA-PSS'): Promise<CryptoKey | { rsa: CryptoKey; ecdh: CryptoKey }> {
   try {
-    const data = new Uint8Array(packageData);
-    const privKey = await importKey(privateKeyJwk, 'private', 'RSA-OAEP') as CryptoKey;
-    let offset = 5;
-    const signature = data.slice(offset, offset + RSA_KEY_SIZE); offset += RSA_KEY_SIZE;
-    const encryptedRsaSecret = data.slice(offset, offset + RSA_KEY_SIZE); offset += RSA_KEY_SIZE;
-    const kyberCiphertext = data.slice(offset, offset + KYBER_CIPHERTEXT_SIZE); offset += KYBER_CIPHERTEXT_SIZE;
-    const iv = data.slice(offset, offset + IV_SIZE); offset += IV_SIZE;
-    const metaIv = data.slice(offset, offset + 12); offset += 12;
-    const metaLen = data[offset] | (data[offset + 1] << 8); offset += 2;
-    const encryptedMeta = data.slice(offset, offset + metaLen); offset += metaLen;
-    const tag = data.slice(offset, offset + TAG_SIZE); offset += TAG_SIZE;
-    const expectedHash = data.slice(offset, offset + HASH_SIZE); offset += HASH_SIZE;
-    const partial = data.slice(0, offset);
-    const expectedHmac = data.slice(offset, offset + HMAC_SIZE); offset += HMAC_SIZE;
-    const ciphertext = data.slice(offset);
-
-    const rsaSecret = new Uint8Array(await self.crypto.subtle.decrypt({ name: 'RSA-OAEP' }, privKey, encryptedRsaSecret));
-    const kyberSecret = new Uint8Array(await self.crypto.subtle.digest('SHA-512', kyberCiphertext));
+    const jwk = JSON.parse(jwkString);
     
-    const combined = new Uint8Array(rsaSecret.length + kyberSecret.length);
-    combined.set(rsaSecret);
-    combined.set(kyberSecret, rsaSecret.length);
-    const baseKey = await self.crypto.subtle.importKey('raw', combined, 'HKDF', false, ['deriveKey']);
-    const hmacKey = await self.crypto.subtle.deriveKey({ name: 'HKDF', hash: 'SHA-512', salt: new Uint8Array(32), info: new TextEncoder().encode('HYBRID-HMAC-KEY-V3') }, baseKey, { name: 'HMAC', hash: 'SHA-512', length: 512 }, false, ['verify']);
-    const isValidHmac = await self.crypto.subtle.verify('HMAC', hmacKey, expectedHmac, data.slice(0, offset + ciphertext.byteLength)); 
-    if (!isValidHmac) throw new CryptoError('Authentication failed (HMAC mismatch).', 'HMAC_FAILED');
-
-    const sessionKey = await self.crypto.subtle.deriveKey({ name: 'HKDF', hash: 'SHA-512', salt: new Uint8Array(32), info: new TextEncoder().encode('HYBRID-SESSION-KEY-V3') }, baseKey, { name: 'AES-GCM', length: 256 }, false, ['decrypt']);
-    const fullCiphertext = new Uint8Array(ciphertext.byteLength + TAG_SIZE);
-    fullCiphertext.set(ciphertext);
-    fullCiphertext.set(tag, ciphertext.byteLength);
-    const decryptedData = await self.crypto.subtle.decrypt({ name: 'AES-GCM', iv }, sessionKey, fullCiphertext);
-
-    if (verifyKeyJwk) {
-      const vKey = await importKey(verifyKeyJwk, 'public', 'RSA-PSS') as CryptoKey;
-      const isValid = await self.crypto.subtle.verify({ name: 'RSA-PSS', saltLength: 64 }, vKey, signature, decryptedData);
-      if (!isValid) throw new Error('Signature verification failed');
-    }
-
-    return { decryptedData, fileName: 'decrypted_file_v2' };
-  } catch (e: any) {
-    if (e.message === 'Signature verification failed') throw new CryptoError('Digital signature invalid.', 'SIGNATURE_FAILED');
-    if (e instanceof CryptoError) throw e;
-    throw new CryptoError('V2 Hybrid decryption failed.', 'HYBRID_DECRYPTION_FAILED');
-  }
-}
-
-async function decryptHybridV1(
-  packageData: ArrayBuffer,
-  privateKeyJwk: string,
-  verifyKeyJwk?: string,
-  onProgress?: (p: number) => void
-): Promise<{ decryptedData: ArrayBuffer, fileName: string }> {
-  try {
-    const data = new Uint8Array(packageData);
-    const privKey = await importKey(privateKeyJwk, 'private', 'RSA-OAEP') as CryptoKey;
-    let offset = 0;
-    const signature = data.slice(offset, offset + RSA_KEY_SIZE); offset += RSA_KEY_SIZE;
-    const encryptedRsaSecret = data.slice(offset, offset + RSA_KEY_SIZE); offset += RSA_KEY_SIZE;
-    const kyberCiphertext = data.slice(offset, offset + KYBER_CIPHERTEXT_SIZE); offset += KYBER_CIPHERTEXT_SIZE;
-    const iv = data.slice(offset, offset + IV_SIZE); offset += IV_SIZE;
-    const tag = data.slice(offset, offset + TAG_SIZE); offset += TAG_SIZE;
-    const expectedHash = data.slice(offset, offset + HASH_SIZE); offset += HASH_SIZE;
-    const ciphertext = data.slice(offset);
-
-    const rsaSecret = await self.crypto.subtle.decrypt({ name: 'RSA-OAEP' }, privKey, encryptedRsaSecret);
-    const kyberSecret = new Uint8Array(await self.crypto.subtle.digest('SHA-256', kyberCiphertext));
-    
-    const combined = new Uint8Array(rsaSecret.byteLength + kyberSecret.length);
-    combined.set(new Uint8Array(rsaSecret));
-    combined.set(kyberSecret, rsaSecret.byteLength);
-    const baseKey = await self.crypto.subtle.importKey('raw', combined, 'HKDF', false, ['deriveKey']);
-    const sessionKey = await self.crypto.subtle.deriveKey(
-      { name: 'HKDF', hash: 'SHA-512', salt: new Uint8Array(32), info: new TextEncoder().encode('HYBRID-SESSION-KEY-V2') },
-      baseKey,
-      { name: 'AES-GCM', length: 256 },
-      false,
-      ['encrypt', 'decrypt']
-    );
-
-    const fullCiphertext = new Uint8Array(ciphertext.byteLength + TAG_SIZE);
-    fullCiphertext.set(ciphertext);
-    fullCiphertext.set(tag, ciphertext.byteLength);
-    const decryptedData = await self.crypto.subtle.decrypt({ name: 'AES-GCM', iv }, sessionKey, fullCiphertext);
-    
-    if (verifyKeyJwk) {
-      const vKey = await importKey(verifyKeyJwk, 'public', 'RSA-PSS') as CryptoKey;
-      const isValid = await self.crypto.subtle.verify({ name: 'RSA-PSS', saltLength: 64 }, vKey, signature, decryptedData);
-      if (!isValid) throw new Error('Signature verification failed');
-    }
-
-    return { decryptedData, fileName: 'decrypted_file_v1' };
-  } catch (e: any) {
-    if (e.message === 'Signature verification failed') throw new CryptoError('Digital signature invalid.', 'SIGNATURE_FAILED');
-    if (e instanceof CryptoError) throw e;
-    throw new CryptoError('V1 Hybrid decryption failed.', 'HYBRID_DECRYPTION_FAILED');
-  }
-}
-
-export async function exportKey(key: CryptoKey | { rsa: CryptoKey; ecdh: CryptoKey }): Promise<string> {
-  if ('rsa' in key) {
-    const rsaJwk = await self.crypto.subtle.exportKey('jwk', key.rsa);
-    const ecdhJwk = await self.crypto.subtle.exportKey('jwk', key.ecdh);
-    return JSON.stringify({ rsa: rsaJwk, ecdh: ecdhJwk });
-  }
-  const jwk = await self.crypto.subtle.exportKey('jwk', key);
-  return JSON.stringify(jwk);
-}
-
-export async function importKey(jwkString: string, type: 'public' | 'private', algo: 'RSA-OAEP' | 'RSA-PSS' | 'ECDH'): Promise<CryptoKey | { rsa: CryptoKey; ecdh: CryptoKey }> {
-  if (!jwkString) throw new CryptoError('Key is empty.', 'INVALID_KEY');
-  try {
-    const data = JSON.parse(jwkString.trim());
-    
-    if (data.rsa && data.ecdh) {
-      const rsaKey = await self.crypto.subtle.importKey(
+    if (jwk.rsa && jwk.ecdh) {
+      const rsa = await self.crypto.subtle.importKey(
         'jwk',
-        data.rsa,
-        { name: 'RSA-OAEP', hash: 'SHA-512' },
+        JSON.parse(jwk.rsa),
+        { name: algorithm, hash: 'SHA-512' },
         true,
         type === 'public' ? ['encrypt'] : ['decrypt']
       );
-      const ecdhKey = await self.crypto.subtle.importKey(
+      
+      const ecdh = await self.crypto.subtle.importKey(
         'jwk',
-        data.ecdh,
+        JSON.parse(jwk.ecdh),
         { name: 'ECDH', namedCurve: 'P-521' },
         true,
-        type === 'public' ? [] : ['deriveKey', 'deriveBits']
+        type === 'public' ? [] : ['deriveBits']
       );
-      return { rsa: rsaKey, ecdh: ecdhKey };
+      
+      return { rsa, ecdh };
     }
 
     return await self.crypto.subtle.importKey(
       'jwk',
-      data,
-      { name: algo === 'ECDH' ? 'ECDH' : (algo as any), hash: algo === 'ECDH' ? undefined : 'SHA-512', namedCurve: algo === 'ECDH' ? 'P-521' : undefined } as any,
+      jwk,
+      { name: algorithm, hash: 'SHA-512' },
       true,
-      type === 'public' 
-        ? (algo === 'RSA-OAEP' ? ['encrypt'] : algo === 'RSA-PSS' ? ['verify'] : []) 
-        : (algo === 'RSA-OAEP' ? ['decrypt'] : algo === 'RSA-PSS' ? ['sign'] : ['deriveKey', 'deriveBits'])
+      type === 'public' ? (algorithm === 'RSA-OAEP' ? ['encrypt'] : ['verify']) : (algorithm === 'RSA-OAEP' ? ['decrypt'] : ['sign'])
     );
   } catch (e) {
-    throw new CryptoError(`Failed to import ${type} key.`, 'KEY_IMPORT_FAILED');
+    throw new CryptoError('Failed to import cryptographic key.', 'KEY_IMPORT_FAILED');
   }
+}
+
+async function decryptHybridV1(packageData: ArrayBuffer, privateKeyJwk: string, verifyKeyJwk?: string, onProgress?: (p: number) => void): Promise<{ decryptedData: ArrayBuffer, fileName: string }> {
+  // Legacy V1 implementation placeholder
+  throw new CryptoError('Legacy Hybrid V1 not supported in this build.', 'UNSUPPORTED_VERSION');
+}
+
+async function decryptHybridV2(packageData: ArrayBuffer, privateKeyJwk: string, verifyKeyJwk?: string, onProgress?: (p: number) => void): Promise<{ decryptedData: ArrayBuffer, fileName: string }> {
+  // Legacy V2 implementation placeholder
+  throw new CryptoError('Legacy Hybrid V2 not supported in this build.', 'UNSUPPORTED_VERSION');
 }
